@@ -87,7 +87,7 @@ jobs:
         run: |
           echo "Files in dist/:"
           ls -la dist/
-          
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:

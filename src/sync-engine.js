@@ -391,6 +391,7 @@ class SyncEngine {
       '7BITPARTNERS_SCRAPE': this.sync7BitPartnersScrape,
       'WYNTA_SCRAPE': this.syncWyntaScrape,
       'DECKMEDIA': this.syncDeckMedia,
+      'RTG': this.syncRTGNew,
       'RTG_ORIGINAL': this.syncRTG,
       'RIVAL': this.syncRival,
       'CASINO_REWARDS': this.syncCasinoRewards,
@@ -1302,7 +1303,7 @@ class SyncEngine {
             existing.clicks += parseInt(rowObj.visits_count || rowObj.visits || rowObj.clicks || rowObj.hits || 0);
             existing.impressions += parseInt(rowObj.impressions || rowObj.views || 0);
             existing.signups += parseInt(rowObj.registrations_count || rowObj.registrations || rowObj.signups || 0);
-            existing.ftds += parseInt(rowObj.first_deposits_count || rowObj.ftd_count || rowObj.first_deposits || rowObj.ftd || 0);
+            existing.ftds += parseInt(rowObj.first_deposits_count || rowObj.first_depositors_count || rowObj.depositors_count || rowObj.ftd_count || rowObj.first_deposits || rowObj.ftd || rowObj.depositors || 0);
             existing.deposits += parseMoneyValue(rowObj.deposits_sum || rowObj.deposits || rowObj.deposit_amount);
             existing.revenue += parseMoneyValue(rowObj.partner_income || rowObj.commission || rowObj.revenue);
 
@@ -1311,6 +1312,12 @@ class SyncEngine {
             // Standard object format
             if (stats.length === 0) {
               this.log(`Parsing standard format, keys: ${Object.keys(row).join(', ')}`);
+              // Log all values for debugging FTD issue
+              for (const [key, val] of Object.entries(row)) {
+                if (key.toLowerCase().includes('deposit') || key.toLowerCase().includes('ftd')) {
+                  this.log(`  -> ${key}: ${JSON.stringify(val)}`);
+                }
+              }
             }
 
             // Aggregate by date (handle multiple currency rows)
@@ -1328,7 +1335,7 @@ class SyncEngine {
             existing.clicks += parseInt(row.visits_count || row.clicks || row.hits || row.unique_clicks || 0);
             existing.impressions += parseInt(row.impressions || row.views || row.banner_views || 0);
             existing.signups += parseInt(row.registrations_count || row.registrations || row.signups || row.sign_ups || row.players || 0);
-            existing.ftds += parseInt(row.first_deposits_count || row.first_deposits || row.ftd || row.ftds || row.first_time_depositors || row.new_depositors || 0);
+            existing.ftds += parseInt(row.first_deposits_count || row.first_depositors_count || row.depositors_count || row.first_deposits || row.ftd || row.ftds || row.first_time_depositors || row.new_depositors || row.depositors || 0);
             existing.deposits += Math.round(parseFloat(row.deposits_sum || row.deposits || row.deposit_amount || row.total_deposits || 0) * 100);
             existing.revenue += Math.round(parseFloat(row.partner_income || row.commission || row.revenue || row.earnings || row.profit || row.total_commission || 0) * 100);
 
@@ -1454,6 +1461,43 @@ class SyncEngine {
         await scr.closePages();
       }
       return stats;
+    } catch (error) {
+      if (!this.inBatchMode) {
+        await scr.closePages();
+      }
+      throw error;
+    }
+  }
+
+  // RTG (New Version) - Dashboard scraping
+  async syncRTGNew({ program, credentials, config, loginUrl, statsUrl, scraper }) {
+    const scr = scraper || this.scraper;
+    const login = loginUrl || config?.loginUrl || program.login_url;
+    const username = credentials.username;
+    const password = credentials.password;
+
+    if (!username || !password) {
+      throw new Error('Username and password required for RTG');
+    }
+
+    if (!login) {
+      throw new Error('Login URL required for RTG');
+    }
+
+    this.log('Starting RTG (new) dashboard scrape...');
+
+    try {
+      const statsData = await scr.scrapeRTGNew({
+        loginUrl: login,
+        username,
+        password,
+        programName: program.name
+      });
+
+      if (!this.inBatchMode) {
+        await scr.closePages();
+      }
+      return statsData;
     } catch (error) {
       if (!this.inBatchMode) {
         await scr.closePages();

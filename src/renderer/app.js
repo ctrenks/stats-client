@@ -175,9 +175,105 @@ async function loadProviders() {
   providers.forEach((p) => {
     const option = document.createElement("option");
     option.value = p.code;
-    option.textContent = p.name;
+    option.textContent = p.icon ? `${p.icon} ${p.name}` : p.name;
     elements.programProvider.appendChild(option);
   });
+}
+
+// Update credential fields based on provider's auth type
+function updateCredentialFields(provider, isEditMode = false) {
+  const usernameGroup = elements.credUsername?.parentElement;
+  const passwordGroup = elements.credPassword?.parentElement;
+  const apiKeyGroup = elements.credApiKey?.parentElement;
+  const baseUrlGroup = elements.programApiUrl?.parentElement;
+  const loginUrlGroup = elements.programLoginUrl?.parentElement;
+  const descriptionEl = document.getElementById('providerDescription');
+
+  if (!usernameGroup || !passwordGroup || !apiKeyGroup) return;
+
+  // Get label elements
+  const usernameLabel = usernameGroup.querySelector('label');
+  const passwordLabel = passwordGroup.querySelector('label');
+  const apiKeyLabel = apiKeyGroup.querySelector('label');
+  const baseUrlLabel = baseUrlGroup?.querySelector('label');
+  const loginUrlLabel = loginUrlGroup?.querySelector('label');
+
+  // Reset to defaults first
+  usernameGroup.style.display = 'block';
+  passwordGroup.style.display = 'block';
+  apiKeyGroup.style.display = 'block';
+  if (usernameLabel) usernameLabel.textContent = 'Username';
+  if (passwordLabel) passwordLabel.textContent = 'Password';
+  if (apiKeyLabel) apiKeyLabel.textContent = 'API Key';
+  if (baseUrlLabel) baseUrlLabel.textContent = 'API URL';
+  if (loginUrlLabel) loginUrlLabel.textContent = 'Login URL';
+  if (descriptionEl) {
+    descriptionEl.textContent = '';
+    descriptionEl.style.display = 'none';
+  }
+
+  if (!provider) return;
+
+  // Update field visibility based on authType
+  const authType = provider.authType || 'CREDENTIALS';
+
+  if (authType === 'API_KEY') {
+    // Only show API key field
+    usernameGroup.style.display = 'none';
+    passwordGroup.style.display = 'none';
+    apiKeyGroup.style.display = 'block';
+    if (apiKeyLabel) apiKeyLabel.textContent = provider.apiKeyLabel || 'API Key / Token';
+  } else if (authType === 'CREDENTIALS') {
+    // Only show username/password
+    usernameGroup.style.display = 'block';
+    passwordGroup.style.display = 'block';
+    apiKeyGroup.style.display = 'none';
+  } else {
+    // BOTH - show all fields with helpful labels
+    usernameGroup.style.display = 'block';
+    passwordGroup.style.display = 'block';
+    apiKeyGroup.style.display = 'block';
+    if (apiKeyLabel) apiKeyLabel.textContent = provider.apiKeyLabel || 'API Key (optional if using login)';
+  }
+
+  // Update custom labels if provided
+  if (provider.usernameLabel && usernameLabel) {
+    usernameLabel.textContent = provider.usernameLabel;
+  }
+  if (provider.passwordLabel && passwordLabel) {
+    passwordLabel.textContent = provider.passwordLabel;
+  }
+  if (provider.apiKeyLabel && apiKeyLabel) {
+    apiKeyLabel.textContent = provider.apiKeyLabel;
+  }
+  if (provider.baseUrlLabel && baseUrlLabel) {
+    baseUrlLabel.textContent = provider.baseUrlLabel;
+  }
+
+  // Show/hide base URL field based on requiresBaseUrl
+  if (baseUrlGroup) {
+    // Show if required, or if provider has a default baseUrl, or always show for flexibility
+    baseUrlGroup.style.display = 'block';
+    if (provider.requiresBaseUrl && baseUrlLabel) {
+      baseUrlLabel.textContent = (provider.baseUrlLabel || 'Affiliate Dashboard URL') + ' *';
+    }
+  }
+
+  // Pre-fill URLs if provided AND not in edit mode (don't overwrite user's URLs)
+  if (!isEditMode) {
+    if (provider.loginUrl && elements.programLoginUrl) {
+      elements.programLoginUrl.value = provider.loginUrl;
+    }
+    if (provider.baseUrl && elements.programApiUrl) {
+      elements.programApiUrl.value = provider.baseUrl;
+    }
+  }
+
+  // Show description
+  if (provider.description && descriptionEl) {
+    descriptionEl.textContent = provider.description;
+    descriptionEl.style.display = 'block';
+  }
 }
 
 // Load dashboard data
@@ -335,6 +431,7 @@ function createFreshModal() {
           <select class="select" id="programProvider" required>
             <option value="">Select provider...</option>
           </select>
+          <p id="providerDescription" class="settings-note" style="display: none; margin-top: 8px; font-size: 0.85em; color: var(--text-secondary);"></p>
         </div>
         <div class="form-group">
           <label for="programCurrency">Currency</label>
@@ -438,9 +535,14 @@ function createFreshModal() {
   const revshareGroup = document.getElementById("revshareGroup");
   const revshareInput = document.getElementById("revsharePercent");
 
-  // Show/hide RTG options based on provider selection
+  // Show/hide RTG options and credential fields based on provider selection
   elements.programProvider.addEventListener("change", (e) => {
-    if (e.target.value === "RTG_ORIGINAL") {
+    const selectedCode = e.target.value;
+    const provider = providers.find(p => p.code === selectedCode);
+    const isEditMode = editingProgramId !== null;
+
+    // RTG options
+    if (selectedCode === "RTG_ORIGINAL") {
       rtgOptionsSection.style.display = "block";
     } else {
       rtgOptionsSection.style.display = "none";
@@ -448,6 +550,15 @@ function createFreshModal() {
       revshareGroup.style.display = "none";
       revshareInput.value = "";
     }
+
+    // Clear URLs when changing provider in add mode (not edit mode)
+    if (!isEditMode && provider) {
+      elements.programLoginUrl.value = '';
+      elements.programApiUrl.value = '';
+    }
+
+    // Credential field visibility based on authType
+    updateCredentialFields(provider, isEditMode);
   });
 
   // Show/hide revshare input based on D-W-C checkbox
@@ -473,7 +584,7 @@ async function loadPrograms() {
   updateProgramsSelect();
 }
 
-// Render programs list
+// Render programs list (sorted alphabetically)
 function renderPrograms() {
   if (programs.length === 0) {
     elements.programsList.innerHTML = `
@@ -490,17 +601,26 @@ function renderPrograms() {
     return;
   }
 
-  elements.programsList.innerHTML = programs
-    .map((p, index) => {
+  // Sort programs alphabetically by name
+  const sortedPrograms = [...programs].sort((a, b) =>
+    a.name.toLowerCase().localeCompare(b.name.toLowerCase())
+  );
+
+  elements.programsList.innerHTML = renderProgramCards(sortedPrograms);
+  attachProgramEventHandlers();
+}
+
+// Render program cards
+function renderProgramCards(programList) {
+  return programList
+    .map((p) => {
       const lastSync = p.last_sync
         ? new Date(p.last_sync).toLocaleDateString()
         : "Never";
       const hasError = p.last_error ? "has-error" : "";
 
       return `
-    <div class="program-card ${hasError}" data-id="${
-        p.id
-      }" data-index="${index}">
+    <div class="program-card ${hasError}" data-id="${p.id}">
       <div class="program-info">
         <span class="program-name">${escapeHtml(p.name)}</span>
         <div class="program-meta">
@@ -517,30 +637,30 @@ function renderPrograms() {
         }
       </div>
       <div class="program-actions">
-        <button class="btn btn-sm sync-btn" data-index="${index}" title="Sync this program">
+        <button class="btn btn-sm sync-btn" data-id="${p.id}" title="Sync this program">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
             <path d="M23 4v6h-6"/>
             <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
           </svg>
         </button>
-        <button class="btn btn-sm btn-secondary edit-btn" data-index="${index}">Edit</button>
-        <button class="btn btn-sm btn-purple clone-btn" data-index="${index}" title="Clone this program">Clone</button>
-        <button class="btn btn-sm btn-danger delete-btn" data-index="${index}">Delete</button>
+        <button class="btn btn-sm btn-secondary edit-btn" data-id="${p.id}">Edit</button>
+        <button class="btn btn-sm btn-purple clone-btn" data-id="${p.id}" title="Clone this program">Clone</button>
+        <button class="btn btn-sm btn-danger delete-btn" data-id="${p.id}">Delete</button>
       </div>
     </div>
   `;
     })
     .join("");
+}
 
+// Attach event handlers to program cards
+function attachProgramEventHandlers() {
   // Add click handlers for edit buttons
   document.querySelectorAll(".edit-btn").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
-      const index = parseInt(e.currentTarget.dataset.index);
-      const program = programs[index];
-      if (program) {
-        await editProgram(program.id);
-      } else {
-        console.error("Edit: Program not found at index", index);
+      const programId = e.currentTarget.dataset.id;
+      if (programId) {
+        await editProgram(programId);
       }
     });
   });
@@ -548,20 +668,9 @@ function renderPrograms() {
   // Add click handlers for delete buttons
   document.querySelectorAll(".delete-btn").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
-      const index = parseInt(e.currentTarget.dataset.index);
-      const program = programs[index];
-      if (program) {
-        console.log(
-          "Delete button clicked for program:",
-          program.name,
-          "ID:",
-          program.id,
-          "hasNullId:",
-          program.id === null
-        );
-        await deleteProgram(program.id);
-      } else {
-        console.error("Delete: Program not found at index", index);
+      const programId = e.currentTarget.dataset.id;
+      if (programId) {
+        await deleteProgram(programId);
       }
     });
   });
@@ -569,10 +678,9 @@ function renderPrograms() {
   // Add click handlers for sync buttons
   document.querySelectorAll(".program-actions .sync-btn").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
-      const index = parseInt(e.currentTarget.dataset.index);
-      const program = programs[index];
-      if (program) {
-        await syncProgram(program.id);
+      const programId = e.currentTarget.dataset.id;
+      if (programId) {
+        await syncProgram(programId);
       }
     });
   });
@@ -580,18 +688,10 @@ function renderPrograms() {
   // Add click handlers for clone buttons
   document.querySelectorAll(".clone-btn").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
-      const index = parseInt(e.currentTarget.dataset.index);
-      const program = programs[index];
+      const programId = e.currentTarget.dataset.id;
+      const program = programs.find(p => p.id === programId);
       if (program) {
-        console.log(
-          "Clone button clicked for program:",
-          program.name,
-          "ID:",
-          program.id
-        );
-        await cloneProgram(program.id, program.name);
-      } else {
-        console.error("Clone: Program not found at index", index);
+        await cloneProgram(programId, program.name);
       }
     });
   });
@@ -661,32 +761,23 @@ function renderTemplates() {
     return;
   }
 
-  // Use filtered templates
-  templates = availableTemplates;
+  // Sort templates alphabetically and use filtered list
+  templates = availableTemplates.sort((a, b) =>
+    a.name.toLowerCase().localeCompare(b.name.toLowerCase())
+  );
 
   elements.templatesList.innerHTML = templates
     .map((t, index) => {
-      const loginUrl =
-        t.loginUrl || t.config?.loginUrl || t.config?.baseUrl || "";
-      const apiUrl = t.apiUrl || t.config?.apiUrl || t.config?.baseUrl || "";
+      const icon = t.icon || '';
+      const description = t.description || '';
 
       return `
     <div class="template-card">
       <div class="template-header">
-        <span class="template-name">${escapeHtml(t.name)}</span>
+        <span class="template-name">${icon ? icon + ' ' : ''}${escapeHtml(t.name)}</span>
         <span class="template-provider">${escapeHtml(t.provider)}</span>
       </div>
-      <div class="template-code">${escapeHtml(t.code)}</div>
-      ${
-        loginUrl
-          ? `<div class="template-url">Login: ${escapeHtml(loginUrl)}</div>`
-          : ""
-      }
-      ${
-        apiUrl && apiUrl !== loginUrl
-          ? `<div class="template-url">API: ${escapeHtml(apiUrl)}</div>`
-          : ""
-      }
+      ${description ? `<div class="template-description">${escapeHtml(description)}</div>` : ''}
       <button class="btn btn-sm btn-primary import-btn" data-index="${index}">
         Import
       </button>
@@ -743,6 +834,10 @@ function showAddProgramModal() {
 
   editingProgramId = null;
   elements.modalTitle.textContent = "Add Program";
+
+  // Reset credential fields to default visibility (show all)
+  updateCredentialFields(null);
+
   elements.modalOverlay.classList.add("active");
 
   // Focus on the first input
@@ -774,6 +869,10 @@ async function editProgram(id) {
   elements.programCurrency.value = program.currency || "USD";
   elements.programLoginUrl.value = program.login_url || "";
   elements.programApiUrl.value = program.api_url || "";
+
+  // Update credential field visibility based on provider (edit mode - don't overwrite URLs)
+  const provider = providers.find(p => p.code === program.provider);
+  updateCredentialFields(provider, true);
 
   // Load credentials
   try {
@@ -953,6 +1052,7 @@ async function navigateTo(view) {
     programs: "Programs",
     templates: "Configured Programs",
     stats: "Statistics",
+    payments: "Payment Tracking",
     settings: "Settings",
   };
   elements.pageTitle.textContent = titles[view] || "Dashboard";
@@ -965,6 +1065,11 @@ async function navigateTo(view) {
   // Set default to "This Month" when navigating to Statistics
   if (view === "stats") {
     setDateRange("thisMonth");
+  }
+
+  // Load payments data when navigating to Payments
+  if (view === "payments") {
+    await loadPaymentsView();
   }
 }
 
@@ -2012,3 +2117,107 @@ function setupLicenseHandlers() {
 }
 
 // No more global onclick handlers needed - using event listeners
+
+// =====================
+// Payment Tracking
+// =====================
+
+let currentPaymentMonth = null;
+
+async function loadPaymentsView() {
+  const monthSelect = document.getElementById("paymentMonthSelect");
+
+  // Get payment summary for last 12 months
+  const summary = await window.api.getPaymentSummary(12);
+
+  // Populate month dropdown
+  monthSelect.innerHTML = summary.map((m, idx) =>
+    `<option value="${m.month}" ${idx === 0 ? 'selected' : ''}>${m.label}</option>`
+  ).join('');
+
+  // Load the first (most recent) month by default
+  if (summary.length > 0) {
+    currentPaymentMonth = summary[0].month;
+    await loadPaymentsForMonth(currentPaymentMonth);
+  }
+
+  // Add change listener
+  monthSelect.addEventListener("change", async (e) => {
+    currentPaymentMonth = e.target.value;
+    await loadPaymentsForMonth(currentPaymentMonth);
+  });
+}
+
+async function loadPaymentsForMonth(month) {
+  const paymentsList = document.getElementById("paymentsList");
+  const programsWithRevenue = await window.api.getProgramsWithRevenue(month);
+
+  // Update summary counts
+  const paidCount = programsWithRevenue.filter(p => p.payment?.is_paid).length;
+  const unpaidCount = programsWithRevenue.length - paidCount;
+  const totalRevenue = programsWithRevenue.reduce((sum, p) => sum + (p.total_revenue || 0), 0);
+
+  document.getElementById("paidCount").textContent = paidCount;
+  document.getElementById("unpaidCount").textContent = unpaidCount;
+  document.getElementById("paymentTotalRevenue").textContent = formatCurrency(totalRevenue, defaultCurrency);
+
+  if (programsWithRevenue.length === 0) {
+    paymentsList.innerHTML = `
+      <div class="empty-state">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="1" y="4" width="22" height="16" rx="2" ry="2"/>
+          <line x1="1" y1="10" x2="23" y2="10"/>
+        </svg>
+        <h3>No Payments to Track</h3>
+        <p>No programs had revenue for this month</p>
+      </div>
+    `;
+    return;
+  }
+
+  paymentsList.innerHTML = programsWithRevenue.map(p => {
+    const isPaid = p.payment?.is_paid;
+    const paidDate = p.payment?.paid_date
+      ? new Date(p.payment.paid_date).toLocaleDateString()
+      : '';
+
+    return `
+      <div class="payment-card ${isPaid ? 'is-paid' : ''}" data-program-id="${p.id}" data-month="${month}">
+        <div class="payment-checkbox" data-program-id="${p.id}" data-month="${month}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+            <polyline points="20 6 9 17 4 12"/>
+          </svg>
+        </div>
+        <div class="payment-info">
+          <div class="payment-program-name">${escapeHtml(p.name)}</div>
+          <div class="payment-meta">
+            <span>${escapeHtml(p.provider)}</span>
+            <span>${p.total_ftds || 0} FTDs</span>
+          </div>
+        </div>
+        <div class="payment-amount">${formatCurrency(p.total_revenue || 0, p.currency || defaultCurrency)}</div>
+        <div class="payment-date">${paidDate}</div>
+      </div>
+    `;
+  }).join('');
+
+  // Attach click handlers to checkboxes
+  document.querySelectorAll('.payment-checkbox').forEach(checkbox => {
+    checkbox.addEventListener('click', async (e) => {
+      const programId = e.currentTarget.dataset.programId;
+      const month = e.currentTarget.dataset.month;
+      await togglePaymentStatus(programId, month);
+    });
+  });
+}
+
+// Toggle payment status
+async function togglePaymentStatus(programId, month) {
+  try {
+    await window.api.togglePaymentStatus(programId, month);
+    await loadPaymentsForMonth(month);
+    showToast("Payment status updated", "success");
+  } catch (error) {
+    showToast("Failed to update payment: " + error.message, "error");
+  }
+}

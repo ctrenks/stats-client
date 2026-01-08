@@ -763,7 +763,7 @@ class Scraper {
             !h.includes('_count') && !h.includes('count')
           );
 
-          // For FTD: look for QFTD or FTD
+          // For FTD: look for QFTD or FTD column (if exists)
           const ftdIdx = headers.findIndex(h =>
             h === 'qftd' || h === 'ftd' ||
             (h.includes('ftd') && !h.includes('count'))
@@ -771,7 +771,7 @@ class Scraper {
 
           // For deposits: look for "deposits" column but NOT "deposit_count" or "net_deposits"
           const depositIdx = headers.findIndex(h =>
-            h === 'deposits' && !h.includes('net')
+            h === 'deposits' && !h.includes('net') && !h.includes('count')
           );
 
           const registrationIdx = headers.findIndex(h =>
@@ -2635,34 +2635,72 @@ class Scraper {
         // STEP 1: Click the login button to reveal the login form
         this.log('Looking for login button to reveal form...');
 
-      const loginButtonClicked = await page.evaluate(() => {
-        // Look for buttons with login-related text
-        const buttons = document.querySelectorAll('button, a, .btn, [role="button"]');
-        for (const btn of buttons) {
-          const text = (btn.textContent || '').toLowerCase().trim();
-          const href = (btn.href || '').toLowerCase();
+      // First, try clicking by ID (most reliable for sites like Gwages)
+      let loginButtonClicked = { success: false };
 
-          // Skip mailto links and contact/support buttons
-          if (href.includes('mailto:') ||
-              text.includes('contact') ||
-              text.includes('support') ||
-              text.includes('manager') ||
-              text.includes('email')) {
-            continue;
-          }
-
-          // Only click actual login buttons
-          if (text === 'login' ||
-              text === 'log in' ||
-              text === 'sign in' ||
-              text === 'affiliate login' ||
-              (text.includes('log') && text.includes('in') && text.length < 15)) {
-            btn.click();
-            return { success: true, text: btn.textContent.trim() };
-          }
+      try {
+        // Try specific login button IDs first (Gwages uses #login_btn)
+        const loginBtnById = await page.$('#login_btn, #loginBtn, #login-btn, [data-target="right"]#login_btn');
+        if (loginBtnById) {
+          await loginBtnById.click();
+          loginButtonClicked = { success: true, text: 'login_btn (by ID)' };
+          this.log('✓ Clicked login button by ID');
         }
-        return { success: false };
-      });
+      } catch (idClickErr) {
+        this.log(`ID click failed: ${idClickErr.message}`);
+      }
+
+      // If ID click didn't work, try finding by text content
+      if (!loginButtonClicked.success) {
+        loginButtonClicked = await page.evaluate(() => {
+          // Look for buttons with login-related text
+          const buttons = document.querySelectorAll('button, a, .btn, [role="button"], .btn-getstarted');
+          for (const btn of buttons) {
+            const text = (btn.textContent || '').toLowerCase().trim();
+            const href = (btn.href || '').toLowerCase();
+            const tagName = btn.tagName.toLowerCase();
+            const btnType = btn.type ? btn.type.toLowerCase() : '';
+            const btnId = (btn.id || '').toLowerCase();
+
+            // Check for login button ID patterns
+            if (btnId === 'login_btn' || btnId === 'loginbtn' || btnId === 'login-btn') {
+              btn.click();
+              return { success: true, text: `${btn.textContent.trim()} (ID: ${btn.id})` };
+            }
+
+            // Skip submit buttons - we don't want to submit the form!
+            if (btnType === 'submit' || btn.name === 'login' || btn.name === 'submit') {
+              continue;
+            }
+
+            // Skip mailto links and contact/support buttons
+            if (href.includes('mailto:') ||
+                text.includes('contact') ||
+                text.includes('support') ||
+                text.includes('manager') ||
+                text.includes('email')) {
+              continue;
+            }
+
+            // Skip if this is inside a form (it's likely a submit button)
+            if (btn.closest('form')) {
+              continue;
+            }
+
+            // Only click actual login buttons (links that lead to login page, not submit buttons)
+            if ((tagName === 'a' || tagName === 'button') &&
+                (text === 'login' ||
+                 text === 'log in' ||
+                 text === 'sign in' ||
+                 text === 'affiliate login' ||
+                 (text.includes('log') && text.includes('in') && text.length < 15))) {
+              btn.click();
+              return { success: true, text: btn.textContent.trim() };
+            }
+          }
+          return { success: false };
+        });
+      }
 
       if (loginButtonClicked.success) {
         this.log(`✓ Clicked login button: "${loginButtonClicked.text}"`);
@@ -2674,12 +2712,28 @@ class Scraper {
       // STEP 2: Fill in the login form (with retry logic for parallel execution)
       this.log('Filling login credentials...');
 
+      // Wait a bit for sidebar/modal to fully open
+      await this.delay(1500);
+
+      // Selectors - sidebar forms often use different selectors
       const emailSelectors = [
+        // Sidebar-specific selectors (Gwages pattern)
+        '.sidebar input[name="username"]',
+        '.sidebar input[name="email"]',
+        '.sidebar input[type="email"]',
+        '.sidebar input[type="text"]',
+        '[data-component="sidebar"] input[name="username"]',
+        '[data-component="sidebar"] input[name="email"]',
+        // Modal/dialog selectors
+        '.modal input[name="username"]',
+        '.login-form input[name="username"]',
+        // Standard selectors
+        '#username',
+        'input[name="username"]',
         'input[name="email"]',
         'input[type="email"]',
         '#email',
         'input[name="login"]',
-        'input[name="username"]',
         'input[name="user"]',
         'input[placeholder*="mail" i]',
         'input[placeholder*="user" i]',
@@ -2687,6 +2741,16 @@ class Scraper {
       ];
 
       const passwordSelectors = [
+        // Sidebar-specific selectors (Gwages pattern)
+        '.sidebar input[name="password"]',
+        '.sidebar input[type="password"]',
+        '[data-component="sidebar"] input[name="password"]',
+        '[data-component="sidebar"] input[type="password"]',
+        // Modal/dialog selectors
+        '.modal input[name="password"]',
+        '.modal input[type="password"]',
+        '.login-form input[name="password"]',
+        // Standard selectors
         'input[name="password"]',
         'input[type="password"]',
         '#password',
@@ -2697,12 +2761,12 @@ class Scraper {
       let emailInput = null;
       let passwordInput = null;
       let attempts = 0;
-      const maxAttempts = 3;
+      const maxAttempts = 5; // Increased attempts for sidebar animations
 
       while (attempts < maxAttempts && (!emailInput || !passwordInput)) {
         if (attempts > 0) {
           this.log(`Retry attempt ${attempts}/${maxAttempts} to find form fields...`);
-          await this.delay(2000);
+          await this.delay(1500); // Wait for sidebar animation
         }
 
         // Try to find email input
@@ -2713,7 +2777,11 @@ class Scraper {
               if (emailInput) {
                 const isVisible = await page.evaluate(el => {
                   const style = window.getComputedStyle(el);
-                  return style.display !== 'none' && style.visibility !== 'hidden';
+                  const rect = el.getBoundingClientRect();
+                  return style.display !== 'none' &&
+                         style.visibility !== 'hidden' &&
+                         style.opacity !== '0' &&
+                         rect.width > 0 && rect.height > 0;
                 }, emailInput);
 
                 if (isVisible) {
@@ -2737,7 +2805,11 @@ class Scraper {
               if (passwordInput) {
                 const isVisible = await page.evaluate(el => {
                   const style = window.getComputedStyle(el);
-                  return style.display !== 'none' && style.visibility !== 'hidden';
+                  const rect = el.getBoundingClientRect();
+                  return style.display !== 'none' &&
+                         style.visibility !== 'hidden' &&
+                         style.opacity !== '0' &&
+                         rect.width > 0 && rect.height > 0;
                 }, passwordInput);
 
                 if (isVisible) {
@@ -2760,15 +2832,31 @@ class Scraper {
         // Get debug info about what IS on the page
         const pageInfo = await page.evaluate(() => {
           const inputs = Array.from(document.querySelectorAll('input'));
+          const sidebars = document.querySelectorAll('.sidebar, [data-component="sidebar"], .modal, .login-form');
+          const visibleInputs = inputs.filter(i => {
+            const style = window.getComputedStyle(i);
+            const rect = i.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0;
+          });
           return {
             inputCount: inputs.length,
-            inputTypes: inputs.map(i => ({ type: i.type, name: i.name, id: i.id, placeholder: i.placeholder })),
+            visibleInputCount: visibleInputs.length,
+            inputTypes: inputs.map(i => ({
+              type: i.type,
+              name: i.name,
+              id: i.id,
+              placeholder: i.placeholder,
+              visible: visibleInputs.includes(i),
+              parent: i.closest('.sidebar, [data-component="sidebar"], .modal, form')?.className || 'none'
+            })),
+            sidebarCount: sidebars.length,
             url: window.location.href,
             title: document.title
           };
         });
 
-        this.log(`DEBUG - Page has ${pageInfo.inputCount} inputs: ${JSON.stringify(pageInfo.inputTypes)}`, 'warn');
+        this.log(`DEBUG - Page has ${pageInfo.inputCount} inputs (${pageInfo.visibleInputCount} visible), ${pageInfo.sidebarCount} sidebars/modals`, 'warn');
+        this.log(`DEBUG - Inputs: ${JSON.stringify(pageInfo.inputTypes)}`, 'warn');
         throw new Error(`Could not find login form fields on ${pageInfo.url}. Found ${pageInfo.inputCount} inputs but none matched email/password selectors.`);
       }
 
@@ -3300,6 +3388,392 @@ class Scraper {
       }
 
       // Only in headless mode with no dialog, close the page
+      await page.close();
+      throw error;
+    }
+  }
+
+  /**
+   * Scrape RTG (New Version) affiliate stats
+   * Simple dashboard scraping - login and extract visible stats
+   */
+  async scrapeRTGNew({ loginUrl, username, password, programName = 'RTG' }) {
+    this.log(`Starting RTG (new) dashboard scrape...`);
+    await this.launch();
+    let page = await this.browser.newPage();
+
+    try {
+      // Navigate to login page
+      this.log(`Navigating to login: ${loginUrl}`);
+      await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await this.delay(2000);
+
+      // Check if already logged in
+      const currentUrl = page.url();
+      const urlPath = new URL(currentUrl).pathname.toLowerCase();
+      const isAlreadyLoggedIn = !urlPath.includes('/login') &&
+                                !urlPath.endsWith('/') &&
+                                (urlPath.includes('/dashboard') ||
+                                 urlPath.includes('/affiliate') ||
+                                 urlPath.includes('/partner') ||
+                                 urlPath.includes('/reports') ||
+                                 urlPath.includes('/home'));
+
+      if (isAlreadyLoggedIn) {
+        this.log(`✓ Already logged in (at ${currentUrl}), skipping login`);
+      } else {
+        // STEP 1: Check if we need to click a login button to reveal the form (sidebar pattern)
+        this.log('Checking for login button to reveal form...');
+
+        // Try clicking login button by ID first (Gwages uses #login_btn)
+        let loginButtonClicked = false;
+        try {
+          const loginBtnById = await page.$('#login_btn, #loginBtn, #login-btn');
+          if (loginBtnById) {
+            await loginBtnById.click();
+            loginButtonClicked = true;
+            this.log('✓ Clicked login button by ID');
+            await this.delay(2000); // Wait for sidebar animation
+          }
+        } catch (e) {
+          this.log(`ID button click attempt: ${e.message}`);
+        }
+
+        // If no ID button, try finding by text
+        if (!loginButtonClicked) {
+          const clicked = await page.evaluate(() => {
+            const buttons = document.querySelectorAll('a, button, .btn, .btn-getstarted');
+            for (const btn of buttons) {
+              const text = (btn.textContent || '').trim().toLowerCase();
+              const id = (btn.id || '').toLowerCase();
+
+              // Skip if inside a form (submit button)
+              if (btn.closest('form')) continue;
+
+              if (id.includes('login') || text === 'login' || text === 'log in' || text === 'sign in') {
+                btn.click();
+                return true;
+              }
+            }
+            return false;
+          });
+
+          if (clicked) {
+            loginButtonClicked = true;
+            this.log('✓ Clicked login button by text');
+            await this.delay(2000);
+          }
+        }
+
+        // STEP 2: Find and fill login form
+        this.log('Looking for login form...');
+
+        // Common username field selectors (including sidebar patterns)
+        const usernameSelectors = [
+          '.sidebar input[name="username"]',
+          '.sidebar input[name="email"]',
+          '[data-component="sidebar"] input[name="username"]',
+          '.modal input[name="username"]',
+          'input[name="username"]',
+          'input[name="email"]',
+          'input[name="user"]',
+          'input[name="login"]',
+          'input[type="email"]',
+          'input[id*="user"]',
+          'input[id*="email"]',
+          'input[id*="login"]',
+          'input[placeholder*="user" i]',
+          'input[placeholder*="email" i]'
+        ];
+
+        const passwordSelectors = [
+          '.sidebar input[name="password"]',
+          '.sidebar input[type="password"]',
+          '[data-component="sidebar"] input[type="password"]',
+          '.modal input[type="password"]',
+          'input[name="password"]',
+          'input[type="password"]',
+          'input[id*="pass"]'
+        ];
+
+        let usernameField = null;
+        let passwordField = null;
+        let attempts = 0;
+        const maxAttempts = 5;
+
+        // Try multiple times with delays (for sidebar animations)
+        while (attempts < maxAttempts && (!usernameField || !passwordField)) {
+          if (attempts > 0) {
+            this.log(`Retry ${attempts}/${maxAttempts} to find visible form fields...`);
+            await this.delay(1500);
+          }
+
+          for (const selector of usernameSelectors) {
+            const field = await page.$(selector);
+            if (field) {
+              const isVisible = await page.evaluate(el => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       rect.width > 0 && rect.height > 0;
+              }, field);
+              if (isVisible) {
+                usernameField = field;
+                this.log(`Found visible username field: ${selector}`);
+                break;
+              }
+            }
+          }
+
+          for (const selector of passwordSelectors) {
+            const field = await page.$(selector);
+            if (field) {
+              const isVisible = await page.evaluate(el => {
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' &&
+                       style.visibility !== 'hidden' &&
+                       rect.width > 0 && rect.height > 0;
+              }, field);
+              if (isVisible) {
+                passwordField = field;
+                this.log(`Found visible password field: ${selector}`);
+                break;
+              }
+            }
+          }
+
+          attempts++;
+        }
+
+        if (!usernameField || !passwordField) {
+          throw new Error('Could not find visible login form fields');
+        }
+
+        // Fill in credentials
+        await usernameField.click({ clickCount: 3 });
+        await usernameField.type(username, { delay: 50 });
+        await passwordField.click({ clickCount: 3 });
+        await passwordField.type(password, { delay: 50 });
+
+        this.log('Filled login form, submitting...');
+
+        // Submit the form - look for submit button in sidebar/modal too
+        const submitSelectors = [
+          '.sidebar button[type="submit"]',
+          '.sidebar input[type="submit"]',
+          '.sidebar button.login',
+          '[data-component="sidebar"] button[type="submit"]',
+          '.modal button[type="submit"]',
+          'button[type="submit"]',
+          'input[type="submit"]',
+          'button.login',
+          'button.btn-primary',
+          'button[class*="login"]',
+          'button[class*="submit"]'
+        ];
+
+        let submitted = false;
+        for (const selector of submitSelectors) {
+          const button = await page.$(selector);
+          if (button) {
+            const isVisible = await page.evaluate(el => {
+              const style = window.getComputedStyle(el);
+              const rect = el.getBoundingClientRect();
+              return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0;
+            }, button);
+            if (isVisible) {
+              await button.click();
+              submitted = true;
+              this.log(`Clicked submit button: ${selector}`);
+              break;
+            }
+          }
+        }
+
+        if (!submitted) {
+          this.log('No submit button found, pressing Enter');
+          await page.keyboard.press('Enter');
+        }
+
+        // Wait for navigation after login
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+        await this.delay(3000);
+
+        const afterLoginUrl = page.url();
+        this.log(`After login URL: ${afterLoginUrl}`);
+
+        // Check if still on login page (login failed)
+        if (afterLoginUrl.toLowerCase().includes('login') || afterLoginUrl === currentUrl) {
+          const errorText = await page.evaluate(() => {
+            const error = document.querySelector('.error, .alert-danger, .login-error, [class*="error"]');
+            return error ? error.textContent.trim() : null;
+          });
+          throw new Error(errorText || 'Login failed - still on login page');
+        }
+
+        this.log('Login successful!');
+      } // End of "not already logged in" block
+
+      this.log('Extracting dashboard stats...');
+
+      // Helper to extract stats from dashboard
+      const extractDashboardStats = async () => {
+        return await page.evaluate(() => {
+          const result = {
+            clicks: 0,
+            signups: 0,
+            ftds: 0,
+            deposits: 0,
+            revenue: 0,
+            conversionRate: 0
+          };
+
+          // Helper to parse value (removes $, commas, etc)
+          const parseVal = (text) => {
+            if (!text) return 0;
+            const cleaned = text.replace(/[$€£,\s]/g, '').trim();
+            return parseFloat(cleaned) || 0;
+          };
+
+          // Try specific RTG dashboard IDs first
+          const signupEl = document.querySelector('#id_signup');
+          const clickEl = document.querySelector('#id_clicks');
+          const earningEl = document.querySelector('#id_earning');
+
+          if (signupEl) result.signups = parseInt(signupEl.textContent.trim()) || 0;
+          if (clickEl) result.clicks = parseInt(clickEl.textContent.trim()) || 0;
+          if (earningEl) result.revenue = Math.round(parseVal(earningEl.textContent) * 100);
+
+          // Look for conversion rate in the page (e.g., "2.33%", "Conversion Rate: 2.33%")
+          const pageText = document.body.innerText;
+          const conversionMatch = pageText.match(/conversion\s*(?:rate)?[:\s]*(\d+\.?\d*)%/i);
+          if (conversionMatch) {
+            result.conversionRate = parseFloat(conversionMatch[1]) || 0;
+          }
+
+          // Also check for "Conversion Rate" panel
+          const panels = document.querySelectorAll('.summary .panel, .panel, [class*="stat"], [class*="card"], [class*="widget"]');
+          panels.forEach(panel => {
+            const heading = panel.querySelector('.media-heading, .heading, h3, h4, label');
+            const value = panel.querySelector('.lead, .value, .number, p:last-child');
+            if (heading && value) {
+              const headingText = heading.textContent.toLowerCase();
+              const valText = value.textContent.trim();
+
+              if (headingText.includes('conversion') && valText.includes('%')) {
+                const rateMatch = valText.match(/(\d+\.?\d*)%/);
+                if (rateMatch) {
+                  result.conversionRate = parseFloat(rateMatch[1]) || 0;
+                }
+              }
+            }
+          });
+
+          // If specific IDs not found, fallback to text pattern matching
+          if (!signupEl && !clickEl && !earningEl) {
+            panels.forEach(panel => {
+              const heading = panel.querySelector('.media-heading, .heading, h3, h4, label');
+              const value = panel.querySelector('.lead, .value, .number, p:last-child');
+              if (heading && value) {
+                const headingText = heading.textContent.toLowerCase();
+                const valText = value.textContent.trim();
+
+                if (headingText.includes('signup') || headingText.includes('registration')) {
+                  result.signups = parseInt(valText.replace(/,/g, '')) || 0;
+                } else if (headingText.includes('click')) {
+                  result.clicks = parseInt(valText.replace(/,/g, '')) || 0;
+                } else if (headingText.includes('earning') || headingText.includes('commission') || headingText.includes('revenue')) {
+                  result.revenue = Math.round(parseVal(valText) * 100);
+                }
+              }
+            });
+          }
+
+          return result;
+        });
+      };
+
+      // Extract this month's stats
+      const thisMonthStats = await extractDashboardStats();
+
+      // Calculate FTDs from signups × conversion rate (like CellXpert)
+      let calculatedFtds = 0;
+      if (thisMonthStats.conversionRate > 0 && thisMonthStats.signups > 0) {
+        calculatedFtds = Math.round(thisMonthStats.signups * (thisMonthStats.conversionRate / 100));
+        this.log(`Calculated FTDs: ${thisMonthStats.signups} signups × ${thisMonthStats.conversionRate}% = ${calculatedFtds} FTDs`);
+      }
+
+      this.log(`This month stats: clicks=${thisMonthStats.clicks}, signups=${thisMonthStats.signups}, ftds=${calculatedFtds}, revenue=${thisMonthStats.revenue/100}, convRate=${thisMonthStats.conversionRate}%`);
+
+      const allStats = [];
+      const now = new Date();
+      const thisMonthDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+
+      allStats.push({
+        date: thisMonthDate,
+        clicks: thisMonthStats.clicks || 0,
+        impressions: 0,
+        signups: thisMonthStats.signups || 0,
+        ftds: calculatedFtds,
+        deposits: thisMonthStats.deposits || 0,
+        revenue: thisMonthStats.revenue || 0
+      });
+
+      // Try to get last month's stats by clicking "Last Month" link
+      try {
+        this.log('Looking for Last Month link...');
+        const lastMonthClicked = await page.evaluate(() => {
+          const links = document.querySelectorAll('a');
+          for (const link of links) {
+            const text = link.textContent.toLowerCase();
+            if (text.includes('last month') || text.includes('previous month')) {
+              link.click();
+              return true;
+            }
+          }
+          return false;
+        });
+
+        if (lastMonthClicked) {
+          this.log('Clicked Last Month link, waiting for data...');
+          await this.delay(3000);
+
+          const lastMonthStats = await extractDashboardStats();
+
+          // Calculate FTDs from signups × conversion rate
+          let lastMonthFtds = 0;
+          if (lastMonthStats.conversionRate > 0 && lastMonthStats.signups > 0) {
+            lastMonthFtds = Math.round(lastMonthStats.signups * (lastMonthStats.conversionRate / 100));
+            this.log(`Last month calculated FTDs: ${lastMonthStats.signups} signups × ${lastMonthStats.conversionRate}% = ${lastMonthFtds} FTDs`);
+          }
+
+          this.log(`Last month stats: clicks=${lastMonthStats.clicks}, signups=${lastMonthStats.signups}, ftds=${lastMonthFtds}, revenue=${lastMonthStats.revenue/100}, convRate=${lastMonthStats.conversionRate}%`);
+
+          const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+          const lastMonthDate = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, '0')}-01`;
+
+          allStats.push({
+            date: lastMonthDate,
+            clicks: lastMonthStats.clicks || 0,
+            impressions: 0,
+            signups: lastMonthStats.signups || 0,
+            ftds: lastMonthFtds,
+            deposits: lastMonthStats.deposits || 0,
+            revenue: lastMonthStats.revenue || 0
+          });
+        } else {
+          this.log('No Last Month link found', 'info');
+        }
+      } catch (error) {
+        this.log(`Could not get last month stats: ${error.message}`, 'warn');
+      }
+
+      return allStats;
+
+    } catch (error) {
+      this.log(`RTG (new) scrape error: ${error.message}`, 'error');
       await page.close();
       throw error;
     }

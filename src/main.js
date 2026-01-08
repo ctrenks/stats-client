@@ -14,10 +14,7 @@ let mainWindow;
 let db;
 let syncEngine;
 
-// Server URL for fetching templates
-const SERVER_URL = 'https://allmediamatter.com';
-
-// API Key validation URL
+// Server URL for fetching templates and API validation
 const API_URL = 'https://www.statsfetch.com';
 
 // Installation ID - unique per device
@@ -101,10 +98,21 @@ autoUpdater.on('checking-for-update', () => {
 });
 
 autoUpdater.on('update-available', (info) => {
+  const currentVersion = app.getVersion();
+  console.log(`[AUTO-UPDATER] Update available: v${info.version} (current: v${currentVersion})`);
+
+  // Skip if versions are the same (sometimes electron-updater gets confused)
+  if (info.version === currentVersion) {
+    console.log('[AUTO-UPDATER] Versions match, skipping update');
+    sendUpdateStatus('not-available', 'You are running the latest version', info);
+    return;
+  }
+
   sendUpdateStatus('available', `Update available: v${info.version}`, info);
 });
 
 autoUpdater.on('update-not-available', (info) => {
+  console.log(`[AUTO-UPDATER] No update available (current: v${app.getVersion()})`);
   sendUpdateStatus('not-available', 'You are running the latest version', info);
 });
 
@@ -325,11 +333,27 @@ function createWindow() {
   });
 }
 
-// Fetch templates from server using Electron's net module
+// Map database softwareType to sync-engine provider codes
+const SOFTWARE_TO_PROVIDER = {
+  'cellxpert': 'CELLXPERT',
+  'myaffiliates': 'MYAFFILIATES',
+  'income-access': 'INCOME_ACCESS',
+  'netrefer': 'NETREFER',
+  'wynta': 'WYNTA',
+  'affilka': 'AFFILKA',
+  '7bitpartners': '7BITPARTNERS',
+  'deckmedia': 'DECKMEDIA',
+  'rtg': 'RTG',
+  'rtg-original': 'RTG_ORIGINAL',
+  'rival': 'RIVAL',
+  'casino-rewards': 'CASINO_REWARDS',
+  'custom': 'CUSTOM'
+};
+
+// Fetch templates from statsfetch.com API
 async function fetchTemplates() {
   return new Promise((resolve, reject) => {
-    // Use the export endpoint which includes all URLs and config
-    const request = net.request(`${SERVER_URL}/api/stats/templates/export?all=true`);
+    const request = net.request(`${API_URL}/api/templates`);
     let data = '';
 
     request.on('response', (response) => {
@@ -345,8 +369,26 @@ async function fetchTemplates() {
       response.on('end', () => {
         try {
           const json = JSON.parse(data);
-          console.log('Fetched templates:', json);
-          resolve(json.templates || []);
+          console.log('Fetched templates from statsfetch.com:', json);
+
+          // Map API templates to the format expected by the client
+          const templates = (json.templates || []).map(t => ({
+            name: t.name,
+            code: t.name.toLowerCase().replace(/[^a-z0-9]/g, '-'),
+            provider: SOFTWARE_TO_PROVIDER[t.softwareType?.toLowerCase()] || t.softwareType?.toUpperCase().replace(/-/g, '_') || 'CUSTOM',
+            authType: t.authType,
+            loginUrl: t.loginUrl || '',
+            apiUrl: t.baseUrl || '',
+            config: {
+              loginUrl: t.loginUrl || '',
+              apiUrl: t.baseUrl || '',
+              baseUrl: t.baseUrl || ''
+            },
+            description: t.description,
+            icon: t.icon
+          }));
+
+          resolve(templates);
         } catch (e) {
           reject(new Error('Failed to parse response'));
         }
@@ -521,22 +563,29 @@ function setupIpcHandlers() {
     return db.getStatsSummary();
   });
 
-  // Get available provider types
+  // Get available provider/software types for the dropdown
+  // These are the SOFTWARE TYPES (RTG, CellXpert, etc.), not individual program templates
   ipcMain.handle('get-providers', async () => {
-    return [
-      { code: 'CELLXPERT', name: 'Cellxpert', authType: 'BOTH' },
-      { code: 'MYAFFILIATES', name: 'MyAffiliates', authType: 'BOTH' },
-      { code: 'INCOME_ACCESS', name: 'Income Access', authType: 'CREDENTIALS' },
-      { code: 'NETREFER', name: 'NetRefer', authType: 'API_KEY' },
-      { code: 'WYNTA', name: 'Wynta', authType: 'BOTH' },
-      { code: 'AFFILKA', name: 'Affilka (Generic)', authType: 'BOTH' },
-      { code: '7BITPARTNERS', name: '7BitPartners (Affilka)', authType: 'BOTH' },
-      { code: 'DECKMEDIA', name: 'DeckMedia', authType: 'CREDENTIALS' },
-      { code: 'RTG_ORIGINAL', name: 'RTG Original', authType: 'CREDENTIALS' },
-      { code: 'RIVAL', name: 'Rival (CasinoController)', authType: 'CREDENTIALS' },
-      { code: 'CASINO_REWARDS', name: 'Casino Rewards', authType: 'CREDENTIALS' },
-      { code: 'CUSTOM', name: 'Custom / Other', authType: 'CREDENTIALS' }
+    // Software types - these are the scraper/sync engine types
+    const providers = [
+      { code: 'CELLXPERT', name: 'CellXpert', authType: 'CREDENTIALS', icon: '📊' },
+      { code: 'MYAFFILIATES', name: 'MyAffiliates', authType: 'CREDENTIALS', icon: '🤝' },
+      { code: 'INCOME_ACCESS', name: 'Income Access', authType: 'CREDENTIALS', icon: '💰' },
+      { code: 'NETREFER', name: 'NetRefer', authType: 'API_KEY', icon: '🌐', apiKeyLabel: 'API Key' },
+      { code: 'WYNTA', name: 'Wynta', authType: 'CREDENTIALS', icon: '🎲' },
+      { code: 'AFFILKA', name: 'Affilka', authType: 'BOTH', icon: '🔗', requiresBaseUrl: true, baseUrlLabel: 'Affiliate Dashboard URL', apiKeyLabel: 'Statistic Token' },
+      { code: '7BITPARTNERS', name: '7BitPartners', authType: 'BOTH', icon: '🎰', baseUrl: 'https://dashboard.7bitpartners.com', apiKeyLabel: 'Statistic Token' },
+      { code: 'DECKMEDIA', name: 'DeckMedia', authType: 'CREDENTIALS', icon: '🃏' },
+      { code: 'RTG', name: 'RTG (New)', authType: 'CREDENTIALS', icon: '🎮', description: 'RTG new dashboard - scrapes stats panels' },
+      { code: 'RTG_ORIGINAL', name: 'RTG Original', authType: 'CREDENTIALS', icon: '🕹️', description: 'Supports D-W-C revenue calculation' },
+      { code: 'RIVAL', name: 'Rival (CasinoController)', authType: 'CREDENTIALS', icon: '🎯', description: 'Syncs sequentially to avoid rate limits' },
+      { code: 'CASINO_REWARDS', name: 'Casino Rewards', authType: 'CREDENTIALS', icon: '🏆' },
+      { code: 'PARTNERMATRIX', name: 'PartnerMatrix', authType: 'CREDENTIALS', icon: '📈' },
+      { code: 'SCALEO', name: 'Scaleo', authType: 'API_KEY', icon: '⚡', apiKeyLabel: 'API Key' },
+      { code: 'CUSTOM', name: 'Custom / Other', authType: 'CREDENTIALS', icon: '⚙️' }
     ];
+
+    return providers;
   });
 
   // Sync all programs
@@ -621,6 +670,28 @@ function setupIpcHandlers() {
 
   ipcMain.handle('get-program-limit-info', async () => {
     return getProgramLimitInfo();
+  });
+
+  // Get programs categorized by status (needs setup, has errors, working)
+  ipcMain.handle('get-programs-by-status', async () => {
+    return db.getProgramsByStatus();
+  });
+
+  // Payment tracking handlers
+  ipcMain.handle('get-payment-summary', async (event, monthsBack = 6) => {
+    return db.getPaymentSummary(monthsBack);
+  });
+
+  ipcMain.handle('get-programs-with-revenue', async (event, month) => {
+    return db.getProgramsWithRevenueForMonth(month);
+  });
+
+  ipcMain.handle('toggle-payment-status', async (event, programId, month) => {
+    return db.togglePaymentStatus(programId, month);
+  });
+
+  ipcMain.handle('update-payment', async (event, programId, month, data) => {
+    return db.upsertPayment(programId, month, data);
   });
 
   // Auto-updater IPC handlers
