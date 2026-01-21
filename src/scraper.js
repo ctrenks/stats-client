@@ -1,10 +1,17 @@
 /**
  * Web Scraper for affiliate platforms that don't have APIs
  * Uses Puppeteer with Electron's Chromium
+ * Includes stealth mode to avoid bot detection and CAPTCHAs
  */
 
-const puppeteer = require('puppeteer-core');
+const puppeteerCore = require('puppeteer-core');
+const { addExtra } = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const path = require('path');
+
+// Wrap puppeteer-core with puppeteer-extra and add stealth plugin
+const puppeteer = addExtra(puppeteerCore);
+puppeteer.use(StealthPlugin());
 
 class Scraper {
   constructor(db = null, showDialogCallback = null) {
@@ -19,6 +26,38 @@ class Scraper {
   // Helper to wait/delay
   async delay(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // Human-like random delay (variation to look less robotic)
+  async humanDelay(minMs = 500, maxMs = 1500) {
+    const delay = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+    return new Promise(resolve => setTimeout(resolve, delay));
+  }
+
+  // Simulate human-like mouse movement
+  async humanMove(page) {
+    try {
+      const x = Math.floor(Math.random() * 800) + 100;
+      const y = Math.floor(Math.random() * 600) + 100;
+      await page.mouse.move(x, y, { steps: 10 });
+    } catch (e) {
+      // Ignore mouse movement errors
+    }
+  }
+
+  // Human-like typing with random delays
+  async humanType(page, selector, text) {
+    try {
+      await page.focus(selector);
+      await this.humanDelay(100, 300);
+
+      for (const char of text) {
+        await page.keyboard.type(char, { delay: Math.floor(Math.random() * 100) + 30 });
+      }
+    } catch (e) {
+      // Fallback to regular typing
+      await page.type(selector, text);
+    }
   }
 
   setLogCallback(callback) {
@@ -137,7 +176,23 @@ class Scraper {
       headlessMode = false; // Show browser window for debugging
     }
 
-    this.browser = await puppeteer.launch({
+    // Check if the profile is locked (another Chrome using it)
+    const lockFile = path.join(userDataDir, 'SingletonLock');
+    const lockFileWin = path.join(userDataDir, 'lockfile');
+
+    if (fs.existsSync(lockFile) || fs.existsSync(lockFileWin)) {
+      this.log('⚠️ Browser profile may be locked by another Chrome instance');
+      // Try to remove stale lock files
+      try {
+        if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
+        if (fs.existsSync(lockFileWin)) fs.unlinkSync(lockFileWin);
+        this.log('Removed stale lock files');
+      } catch (e) {
+        this.log(`Could not remove lock files: ${e.message}`);
+      }
+    }
+
+    const launchOptions = {
       executablePath,
       headless: headlessMode, // true, false, or 'new'
       userDataDir: userDataDir, // Persist cookies and sessions
@@ -149,6 +204,15 @@ class Scraper {
         '--disable-blink-features=AutomationControlled',
         '--disable-infobars',
         '--window-size=1920,1080',
+        // Anti-detection flags
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--allow-running-insecure-content',
+        // Make browser look more human
+        '--lang=en-US,en',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
         // Ensure cookies are persisted properly
         '--enable-features=NetworkService,NetworkServiceInProcess',
         '--disable-features=SameSiteByDefaultCookies',
@@ -157,39 +221,402 @@ class Scraper {
       ],
       defaultViewport: null, // Use window size
       ignoreDefaultArgs: ['--enable-automation']
+    };
+
+    try {
+      this.browser = await puppeteer.launch(launchOptions);
+      this.log('✓ Browser launched successfully');
+    } catch (launchError) {
+      // Provide more detailed error message
+      const errorMsg = launchError.message || launchError.toString();
+      this.log(`Browser launch failed: ${errorMsg}`, 'error');
+
+      // If it's a profile lock issue, try without userDataDir as fallback
+      if (errorMsg.includes('user data directory') || errorMsg.includes('lock') || errorMsg.includes('undefined')) {
+        this.log('Retrying without persistent profile (cookies will not be saved)...', 'warn');
+
+        // Remove userDataDir to use temp profile
+        delete launchOptions.userDataDir;
+
+        try {
+          this.browser = await puppeteer.launch(launchOptions);
+          this.log('✓ Browser launched with temporary profile');
+        } catch (retryError) {
+          throw new Error(`Browser launch failed: ${retryError.message || retryError}`);
+        }
+      } else {
+        throw new Error(`Browser launch failed: ${errorMsg}`);
+      }
+    }
+  }
+
+  // Detect reCAPTCHA on the page - only for TRULY blocking CAPTCHAs
+  async detectRecaptcha(page) {
+    try {
+      const result = await page.evaluate(() => {
+        const bodyText = document.body ? document.body.innerText : '';
+
+        // ONLY detect truly blocking scenarios:
+
+        // 1. Cloudflare challenge page (full page takeover with minimal content)
+        const isCloudflareChallenge =
+          (bodyText.includes('Checking your browser') && bodyText.length < 1000) ||
+          (bodyText.includes('Just a moment') && bodyText.length < 1000) ||
+          (bodyText.includes('Verify you are human') && document.querySelector('#challenge-running'));
+
+        // 2. Cloudflare challenge elements actively running
+        const hasCfChallenge = !!(
+          document.querySelector('#cf-challenge-running') ||
+          document.querySelector('.cf-browser-verification') ||
+          document.querySelector('#challenge-running')
+        );
+
+        // 3. reCAPTCHA v2 challenge popup (the actual puzzle, not just the checkbox)
+        const hasRecaptchaPuzzle = !!document.querySelector('iframe[src*="google.com/recaptcha/api2/bframe"]');
+
+        // 4. hCaptcha challenge popup
+        const hasHcaptchaPuzzle = !!document.querySelector('iframe[src*="hcaptcha.com/captcha"][style*="visible"]');
+
+        // DON'T detect:
+        // - reCAPTCHA anchor iframe (just the checkbox, not blocking)
+        // - Invisible reCAPTCHA (runs silently in background)
+        // - .g-recaptcha elements (form protection, not blocking)
+        // - Normal pages with reCAPTCHA scripts loaded
+
+        const hasBlockingCaptcha = isCloudflareChallenge || hasCfChallenge || hasRecaptchaPuzzle || hasHcaptchaPuzzle;
+
+        return {
+          hasBlockingCaptcha,
+          bodyLength: bodyText.length,
+          debug: {
+            isCloudflareChallenge,
+            hasCfChallenge,
+            hasRecaptchaPuzzle,
+            hasHcaptchaPuzzle,
+            bodyPreview: bodyText.substring(0, 100)
+          }
+        };
+      });
+
+      if (result.hasBlockingCaptcha) {
+        this.log(`CAPTCHA detected - body length: ${result.bodyLength}`, 'warn');
+        this.log(`Debug: CF=${result.debug.isCloudflareChallenge || result.debug.hasCfChallenge}, reCAPTCHA=${result.debug.hasRecaptchaPuzzle}, hCaptcha=${result.debug.hasHcaptchaPuzzle}`, 'warn');
+      }
+
+      return result.hasBlockingCaptcha;
+    } catch (error) {
+      this.log(`Error detecting reCAPTCHA: ${error.message}`, 'warn');
+      return false;
+    }
+  }
+
+  // Try to automatically click CAPTCHA checkbox/button
+  async tryAutoSolveCaptcha(page) {
+    this.log('Attempting to auto-solve CAPTCHA...');
+
+    try {
+      // Simulate human-like mouse movement first
+      await this.humanMove(page);
+      await this.humanDelay(500, 1000);
+
+      // Try clicking Cloudflare Turnstile checkbox
+      const clickedTurnstile = await page.evaluate(() => {
+        // Look for Cloudflare Turnstile iframe
+        const turnstileFrame = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+        if (turnstileFrame) {
+          return 'turnstile_iframe';
+        }
+
+        // Look for verify button
+        const verifyBtn = document.querySelector('input[type="checkbox"][name*="turnstile"], .cf-turnstile input');
+        if (verifyBtn) {
+          verifyBtn.click();
+          return 'turnstile_checkbox';
+        }
+
+        return null;
+      });
+
+      if (clickedTurnstile === 'turnstile_iframe') {
+        // Click inside the Turnstile iframe
+        const frames = page.frames();
+        for (const frame of frames) {
+          const url = frame.url();
+          if (url.includes('challenges.cloudflare.com')) {
+            try {
+              this.log('Found Cloudflare Turnstile iframe, attempting to click...');
+              // The checkbox is usually in the center of the iframe
+              const checkbox = await frame.$('input[type="checkbox"], .mark, #challenge-stage');
+              if (checkbox) {
+                await this.humanDelay(300, 600);
+                await checkbox.click();
+                this.log('✓ Clicked Turnstile checkbox');
+                await this.delay(3000); // Wait for verification
+                return true;
+              }
+            } catch (e) {
+              this.log(`Turnstile click failed: ${e.message}`);
+            }
+          }
+        }
+      }
+
+      // Try clicking reCAPTCHA v2 checkbox
+      const recaptchaFrame = page.frames().find(frame =>
+        frame.url().includes('google.com/recaptcha')
+      );
+
+      if (recaptchaFrame) {
+        this.log('Found reCAPTCHA iframe, attempting to click checkbox...');
+        try {
+          // Human-like movement before clicking
+          await this.humanDelay(500, 1000);
+
+          // The checkbox has class "recaptcha-checkbox"
+          const checkbox = await recaptchaFrame.$('.recaptcha-checkbox-border, .recaptcha-checkbox, #recaptcha-anchor');
+          if (checkbox) {
+            // Get checkbox position and move mouse there naturally
+            const box = await checkbox.boundingBox();
+            if (box) {
+              // Move mouse to checkbox with human-like movement
+              await page.mouse.move(
+                box.x + box.width / 2 + (Math.random() * 10 - 5),
+                box.y + box.height / 2 + (Math.random() * 10 - 5),
+                { steps: 25 }
+              );
+              await this.humanDelay(100, 300);
+            }
+
+            await checkbox.click();
+            this.log('✓ Clicked reCAPTCHA checkbox');
+            await this.delay(3000); // Wait for verification
+
+            // Check if a challenge appeared
+            const challengeAppeared = await page.evaluate(() => {
+              return !!document.querySelector('iframe[title*="challenge"]');
+            });
+
+            if (challengeAppeared) {
+              this.log('⚠️ Image challenge appeared after clicking', 'warn');
+              return false; // Challenge requires manual solving
+            }
+
+            return true;
+          }
+        } catch (e) {
+          this.log(`reCAPTCHA click failed: ${e.message}`);
+        }
+      }
+
+      // Try clicking hCaptcha checkbox
+      const hcaptchaFrame = page.frames().find(frame =>
+        frame.url().includes('hcaptcha.com')
+      );
+
+      if (hcaptchaFrame) {
+        this.log('Found hCaptcha iframe, attempting to click...');
+        try {
+          const checkbox = await hcaptchaFrame.$('#checkbox, .check');
+          if (checkbox) {
+            await this.humanDelay(300, 600);
+            await checkbox.click();
+            this.log('✓ Clicked hCaptcha checkbox');
+            await this.delay(3000);
+            return true;
+          }
+        } catch (e) {
+          this.log(`hCaptcha click failed: ${e.message}`);
+        }
+      }
+
+      // Try clicking any visible "Verify" or "I'm not a robot" button
+      const clickedButton = await page.evaluate(() => {
+        const buttons = document.querySelectorAll('button, input[type="submit"], input[type="button"], .btn');
+        for (const btn of buttons) {
+          const text = (btn.textContent || btn.value || '').toLowerCase();
+          if (text.includes('verify') || text.includes('not a robot') || text.includes('human')) {
+            btn.click();
+            return text;
+          }
+        }
+        return null;
+      });
+
+      if (clickedButton) {
+        this.log(`✓ Clicked verify button: "${clickedButton}"`);
+        await this.delay(3000);
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      this.log(`Auto-solve CAPTCHA error: ${error.message}`, 'warn');
+      return false;
+    }
+  }
+
+  // Handle reCAPTCHA by trying auto-solve first, then falling back to manual
+  async handleRecaptcha(page, programName = 'Unknown Program', maxWaitTime = 120000) {
+    const hasRecaptcha = await this.detectRecaptcha(page);
+
+    if (!hasRecaptcha) {
+      return { solved: true, wasPresent: false };
+    }
+
+    this.log(`⚠️ CAPTCHA/Challenge detected for ${programName}!`, 'warn');
+
+    // STEP 1: Try to auto-solve by clicking the checkbox
+    this.log('Attempting automatic CAPTCHA solving...', 'info');
+    const autoSolved = await this.tryAutoSolveCaptcha(page);
+
+    if (autoSolved) {
+      // Wait a moment and check if CAPTCHA is gone
+      await this.delay(2000);
+      const stillPresent = await this.detectRecaptcha(page);
+      if (!stillPresent) {
+        this.log('✓ CAPTCHA auto-solved successfully!', 'success');
+        return { solved: true, wasPresent: true, autoSolved: true };
+      }
+      this.log('Auto-click done but challenge still present...', 'warn');
+    }
+
+    // STEP 2: Wait for Cloudflare "Just a moment" to pass automatically
+    const isCloudflare = await page.evaluate(() => {
+      return document.body.innerText.includes('Just a moment') ||
+             document.body.innerText.includes('Checking your browser') ||
+             !!document.querySelector('#challenge-running');
     });
 
-    this.log('✓ Browser launched successfully');
+    if (isCloudflare) {
+      this.log('Cloudflare challenge detected, waiting for automatic verification...', 'info');
+      // Cloudflare usually auto-verifies within 5-10 seconds
+      for (let i = 0; i < 10; i++) {
+        await this.delay(2000);
+        const stillCloudflare = await page.evaluate(() => {
+          return document.body.innerText.includes('Just a moment') ||
+                 document.body.innerText.includes('Checking your browser') ||
+                 !!document.querySelector('#challenge-running');
+        });
+        if (!stillCloudflare) {
+          this.log('✓ Cloudflare challenge passed!', 'success');
+          return { solved: true, wasPresent: true, autoSolved: true };
+        }
+      }
+    }
+
+    // STEP 3: If still present and headless, can't proceed
+    const stillHasCaptcha = await this.detectRecaptcha(page);
+    if (!stillHasCaptcha) {
+      this.log('✓ CAPTCHA resolved!', 'success');
+      return { solved: true, wasPresent: true };
+    }
+
+    if (this.headless) {
+      this.log('CAPTCHA requires manual solving - browser is headless', 'error');
+      this.log('Enable "Show Browser Window" in settings to solve CAPTCHAs manually', 'info');
+      // Don't show dialog for CAPTCHA - it's not a security code input
+      // Just return error so the sync can report it
+      return { solved: false, wasPresent: true, error: 'CAPTCHA_REQUIRES_VISIBLE_BROWSER' };
+    }
+
+    // STEP 4: Browser is visible, wait for user to solve
+    this.log(`Waiting for user to solve CAPTCHA (max ${maxWaitTime / 1000}s)...`, 'info');
+    this.log(`Please solve the CAPTCHA for ${programName} in the browser window.`, 'warn');
+
+    try {
+      await page.bringToFront();
+    } catch (e) {
+      // Ignore
+    }
+
+    // Note: Don't show security code dialog for CAPTCHA - it's solved in the browser
+
+    const startTime = Date.now();
+    while (Date.now() - startTime < maxWaitTime) {
+      await this.delay(2000);
+
+      const stillPresent = await this.detectRecaptcha(page);
+      if (!stillPresent) {
+        this.log('✓ CAPTCHA solved!', 'success');
+        return { solved: true, wasPresent: true };
+      }
+
+      try {
+        const url = page.url();
+        if (url.includes('dashboard') || url.includes('stats') || url.includes('reports')) {
+          this.log('✓ Page navigated past CAPTCHA', 'success');
+          return { solved: true, wasPresent: true };
+        }
+      } catch (e) {
+        // Page might have navigated
+      }
+    }
+
+    this.log('CAPTCHA solving timed out', 'error');
+    return { solved: false, wasPresent: true, error: 'CAPTCHA_TIMEOUT' };
+  }
+
+  // Check for reCAPTCHA after login attempt
+  async checkAndHandleRecaptcha(page, programName) {
+    const result = await this.handleRecaptcha(page, programName);
+
+    if (result.wasPresent && !result.solved) {
+      throw new Error(`CAPTCHA challenge not solved: ${result.error}`);
+    }
+
+    return result;
   }
 
   async close() {
     if (this.browser) {
+      const browserProcess = this.browser.process();
+      const pid = browserProcess ? browserProcess.pid : null;
+
       try {
         // Close all pages first to trigger cookie saves
         const pages = await this.browser.pages();
         for (const page of pages) {
           if (!page.isClosed()) {
-            await page.close();
+            await page.close().catch(() => {});
           }
         }
 
         // Brief wait to ensure all cookies/localStorage are flushed to disk
-        // Chrome writes cookies incrementally, so this is just a safety buffer
         this.log('Waiting for cookies to be saved to disk...');
         await this.delay(500);
 
         this.log('Closing browser...');
         // Add timeout to prevent hanging on browser close
-        await Promise.race([
-          this.browser.close(),
-          new Promise((resolve) => setTimeout(() => {
-            this.log('⚠️ Browser close timed out after 5 seconds, forcing closure', 'warn');
-            resolve();
-          }, 5000))
-        ]);
+        const closePromise = this.browser.close().catch(() => {});
+        const timeoutPromise = new Promise((resolve) => setTimeout(() => {
+          this.log('⚠️ Browser close timed out after 5 seconds', 'warn');
+          resolve('timeout');
+        }, 5000));
+
+        const result = await Promise.race([closePromise, timeoutPromise]);
+
+        // If close timed out and we have a PID, force kill
+        if (result === 'timeout' && pid) {
+          this.log(`Force killing browser process (PID: ${pid})...`, 'warn');
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch (killError) {
+            this.log(`Could not kill process: ${killError.message}`, 'warn');
+          }
+        }
+
         this.log('Browser closed, cookies should be persisted');
       } catch (error) {
         this.log(`Error during browser close: ${error.message}`, 'warn');
+        // Try to force kill if we have a PID
+        if (pid) {
+          try {
+            process.kill(pid, 'SIGKILL');
+            this.log(`Force killed browser process (PID: ${pid})`);
+          } catch (killError) {
+            // Process may already be dead
+          }
+        }
       } finally {
         this.browser = null;
         this.launchPromise = null; // Reset launch promise
@@ -451,6 +878,12 @@ class Scraper {
 
       // Wait for navigation after login
       await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+
+      // Check for reCAPTCHA/CAPTCHA challenge
+      const captchaResult = await this.handleRecaptcha(page, 'CellXpert');
+      if (captchaResult.wasPresent && !captchaResult.solved) {
+        throw new Error('CAPTCHA challenge detected and not solved. Enable "Show Browser Window" in settings to solve manually.');
+      }
 
       // Check if login was successful (no longer on login page)
       const afterLoginUrl = page.url();
@@ -909,37 +1342,48 @@ class Scraper {
   parseCellxpertStats(rawStats, startDate, endDate) {
     const stats = [];
 
-    // Process table rows
-    for (const row of rawStats.rows) {
-      try {
-        const dateStr = this.parseDate(row.date);
-        if (!dateStr) continue;
+    // Check if we have valid summary data first - if so, use only summary (more reliable)
+    const hasSummary = rawStats.summary &&
+      (rawStats.summary.clicks > 0 || rawStats.summary.signups > 0 || rawStats.summary.revenue > 0);
 
-        // Try to extract numbers from the row
-        const numbers = row.raw
-          .map(v => parseFloat(v.replace(/[^0-9.-]/g, '')))
-          .filter(n => !isNaN(n));
+    // Only process table rows if we don't have a valid summary
+    // Table row parsing is unreliable and often picks up garbage data
+    if (!hasSummary && rawStats.rows && rawStats.rows.length > 0) {
+      this.log(`No summary data, trying to parse ${rawStats.rows.length} table rows`);
+      for (const row of rawStats.rows) {
+        try {
+          const dateStr = this.parseDate(row.date);
+          if (!dateStr) continue;
 
-        stats.push({
-          date: dateStr,
-          clicks: numbers[0] || 0,
-          impressions: numbers[1] || 0,
-          signups: numbers[2] || 0,
-          ftds: numbers[3] || 0,
-          deposits: 0,
-          revenue: Math.round((numbers[numbers.length - 1] || 0) * 100)
-        });
-      } catch (e) {
-        // Skip unparseable rows
+          // Try to extract numbers from the row
+          const numbers = row.raw
+            .map(v => parseFloat(v.replace(/[^0-9.-]/g, '')))
+            .filter(n => !isNaN(n));
+
+          stats.push({
+            date: dateStr,
+            clicks: numbers[0] || 0,
+            impressions: numbers[1] || 0,
+            signups: numbers[2] || 0,
+            ftds: numbers[3] || 0,
+            deposits: 0,
+            revenue: Math.round((numbers[numbers.length - 1] || 0) * 100)
+          });
+        } catch (e) {
+          // Skip unparseable rows
+        }
       }
     }
 
-    // If no table data but we have summary, create a single entry for today
-    if (Object.keys(rawStats.summary).length > 0) {
+    // If we have summary data, use only summary entry (more reliable than table rows)
+    if (rawStats.summary && Object.keys(rawStats.summary).length > 0) {
+      // Clear any table row entries - summary is more reliable
+      stats.length = 0;
+
       const today = new Date().toISOString().split('T')[0];
       const summary = rawStats.summary;
 
-      this.log(`Creating stats entry for ${today}`);
+      this.log(`Creating stats entry for ${today} from summary data`);
       this.log(`Raw summary: ${JSON.stringify(summary)}`);
 
       // Calculate FTDs from percentage if available
@@ -1455,13 +1899,13 @@ class Scraper {
     return stats;
   }
 
-  // 7BitPartners scraping
-  async scrape7BitPartners({ loginUrl, username, password, startDate, endDate }) {
+  // Affilka scraping (web login fallback)
+  async scrapeAffilka({ loginUrl, username, password, startDate, endDate }) {
     await this.launch();
     const page = await this.browser.newPage();
 
     try {
-      this.log('Navigating to 7BitPartners login...');
+      this.log('Navigating to Affilka login...');
       await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 30000 });
 
       await this.delay(2000);
@@ -3040,7 +3484,11 @@ class Scraper {
           waitingForSecurityCode = true;
           this.log('Requesting security code from user via popup...', 'info');
 
-          const result = await this.showDialog(programName);
+          // Ensure programName is a string, not an object
+          const displayName = typeof programName === 'string' ? programName : (programName?.name || 'Unknown Program');
+          this.log(`Showing dialog for: ${displayName}`, 'info');
+
+          const result = await this.showDialog(displayName);
           this.log(`Dialog result: clicked=${result.clicked}, code length=${result.code?.length || 0}`, 'info');
 
           if (result.clicked && result.code) {
@@ -3425,18 +3873,36 @@ class Scraper {
         // STEP 1: Check if we need to click a login button to reveal the form (sidebar pattern)
         this.log('Checking for login button to reveal form...');
 
+        // Debug: Log what buttons are on the page
+        const pageButtons = await page.evaluate(() => {
+          const buttons = document.querySelectorAll('a, button, .btn, .btn-getstarted, [id*="login"]');
+          return Array.from(buttons).slice(0, 10).map(b => ({
+            tag: b.tagName,
+            id: b.id,
+            class: b.className,
+            text: (b.textContent || '').trim().substring(0, 30),
+            href: b.href || ''
+          }));
+        });
+        this.log(`Found ${pageButtons.length} potential buttons: ${JSON.stringify(pageButtons.slice(0, 5))}`);
+
         // Try clicking login button by ID first (Gwages uses #login_btn)
         let loginButtonClicked = false;
         try {
           const loginBtnById = await page.$('#login_btn, #loginBtn, #login-btn');
           if (loginBtnById) {
+            this.log('Found login button by ID, clicking...');
+            // Use human-like click
+            await this.humanDelay(200, 500);
             await loginBtnById.click();
             loginButtonClicked = true;
             this.log('✓ Clicked login button by ID');
             await this.delay(2000); // Wait for sidebar animation
+          } else {
+            this.log('No login button found by ID selectors');
           }
         } catch (e) {
-          this.log(`ID button click attempt: ${e.message}`);
+          this.log(`ID button click attempt failed: ${e.message}`, 'warn');
         }
 
         // If no ID button, try finding by text
@@ -3641,10 +4107,12 @@ class Scraper {
           const signupEl = document.querySelector('#id_signup');
           const clickEl = document.querySelector('#id_clicks');
           const earningEl = document.querySelector('#id_earning');
+          const ftdEl = document.querySelector('#id_net_new_acquisitions'); // Net New depositors = FTDs
 
           if (signupEl) result.signups = parseInt(signupEl.textContent.trim()) || 0;
           if (clickEl) result.clicks = parseInt(clickEl.textContent.trim()) || 0;
           if (earningEl) result.revenue = Math.round(parseVal(earningEl.textContent) * 100);
+          if (ftdEl) result.ftds = parseInt(ftdEl.textContent.trim()) || 0;
 
           // Look for conversion rate in the page (e.g., "2.33%", "Conversion Rate: 2.33%")
           const pageText = document.body.innerText;
@@ -3672,7 +4140,7 @@ class Scraper {
           });
 
           // If specific IDs not found, fallback to text pattern matching
-          if (!signupEl && !clickEl && !earningEl) {
+          if (!signupEl && !clickEl && !earningEl && !ftdEl) {
             panels.forEach(panel => {
               const heading = panel.querySelector('.media-heading, .heading, h3, h4, label');
               const value = panel.querySelector('.lead, .value, .number, p:last-child');
@@ -3686,6 +4154,8 @@ class Scraper {
                   result.clicks = parseInt(valText.replace(/,/g, '')) || 0;
                 } else if (headingText.includes('earning') || headingText.includes('commission') || headingText.includes('revenue')) {
                   result.revenue = Math.round(parseVal(valText) * 100);
+                } else if (headingText.includes('depositor') || headingText.includes('net new') || headingText.includes('ftd') || headingText.includes('first time')) {
+                  result.ftds = parseInt(valText.replace(/,/g, '')) || 0;
                 }
               }
             });
@@ -3698,14 +4168,16 @@ class Scraper {
       // Extract this month's stats
       const thisMonthStats = await extractDashboardStats();
 
-      // Calculate FTDs from signups × conversion rate (like CellXpert)
-      let calculatedFtds = 0;
-      if (thisMonthStats.conversionRate > 0 && thisMonthStats.signups > 0) {
-        calculatedFtds = Math.round(thisMonthStats.signups * (thisMonthStats.conversionRate / 100));
-        this.log(`Calculated FTDs: ${thisMonthStats.signups} signups × ${thisMonthStats.conversionRate}% = ${calculatedFtds} FTDs`);
+      // Use actual FTDs if scraped, otherwise calculate from conversion rate
+      let ftds = thisMonthStats.ftds || 0;
+      if (ftds === 0 && thisMonthStats.conversionRate > 0 && thisMonthStats.signups > 0) {
+        ftds = Math.round(thisMonthStats.signups * (thisMonthStats.conversionRate / 100));
+        this.log(`Calculated FTDs: ${thisMonthStats.signups} signups × ${thisMonthStats.conversionRate}% = ${ftds} FTDs`);
+      } else if (ftds > 0) {
+        this.log(`Using scraped FTDs (Net New depositors): ${ftds}`);
       }
 
-      this.log(`This month stats: clicks=${thisMonthStats.clicks}, signups=${thisMonthStats.signups}, ftds=${calculatedFtds}, revenue=${thisMonthStats.revenue/100}, convRate=${thisMonthStats.conversionRate}%`);
+      this.log(`This month stats: clicks=${thisMonthStats.clicks}, signups=${thisMonthStats.signups}, ftds=${ftds}, revenue=${thisMonthStats.revenue/100}, convRate=${thisMonthStats.conversionRate}%`);
 
       const allStats = [];
       const now = new Date();
@@ -3716,7 +4188,7 @@ class Scraper {
         clicks: thisMonthStats.clicks || 0,
         impressions: 0,
         signups: thisMonthStats.signups || 0,
-        ftds: calculatedFtds,
+        ftds: ftds,
         deposits: thisMonthStats.deposits || 0,
         revenue: thisMonthStats.revenue || 0
       });
@@ -4657,7 +5129,7 @@ class Scraper {
     try {
       // Navigate to login page
       this.log(`Navigating to Rival login: ${loginUrl}`);
-      await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+      await page.goto(loginUrl, { waitUntil: 'networkidle2', timeout: 120000 }); // 2 minute timeout for slow pages
       await this.delay(2000);
 
       // Check if we need to click a login button first
@@ -4788,10 +5260,11 @@ class Scraper {
         await page.keyboard.press('Enter');
       }
 
-      // Wait for navigation
+      // Wait for navigation - Rival first-time logins can be slow
+      this.log('Waiting for login to complete (this may take a while on first login)...');
       await Promise.race([
-        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }),
-        this.delay(3000)
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 120000 }), // 2 minutes
+        this.delay(30000) // Wait at least 30 seconds for slow first-time logins
       ]);
 
       const currentUrl = page.url();

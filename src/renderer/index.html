@@ -23,6 +23,15 @@
           </div>
           <span class="logo-text">Stats Fetch</span>
         </div>
+        <!-- Quick Sync All Button -->
+        <button class="sidebar-sync-btn" id="sidebarSyncBtn" title="Sync All Programs">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M23 4v6h-6"/>
+            <path d="M1 20v-6h6"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+          <span>Sync All</span>
+        </button>
       </div>
 
       <nav class="nav">
@@ -76,6 +85,14 @@
       </nav>
 
       <div class="sidebar-footer">
+        <button class="help-btn" id="helpBtn" title="Help & Tutorials">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/>
+            <line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+          <span>Help & Tutorials</span>
+        </button>
         <div class="sync-status" id="syncStatus">
           <div class="sync-dot"></div>
           <span>Ready</span>
@@ -161,7 +178,7 @@
                 </svg>
               </div>
               <div class="stat-content">
-                <span class="stat-value" id="currentMonthRevenue">$0</span>
+                <span class="stat-value money" id="currentMonthRevenue">$0</span>
                 <span class="stat-label">Revenue This Month</span>
               </div>
             </div>
@@ -375,6 +392,65 @@
           </div>
 
           <div class="settings-section">
+            <h2 class="section-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 20px; height: 20px; margin-right: 8px; vertical-align: middle;">
+                <circle cx="12" cy="12" r="10"/>
+                <polyline points="12 6 12 12 16 14"/>
+              </svg>
+              Scheduled Syncs
+            </h2>
+            <p class="settings-note" style="margin-bottom: 12px;">Automatically sync all programs at specific times (uses your local system time).</p>
+
+            <div class="schedule-add-form">
+              <input type="time" id="scheduleTimeInput" class="input" style="width: 130px;">
+              <button class="btn btn-primary" id="addScheduleBtn">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px; margin-right: 4px;">
+                  <line x1="12" y1="5" x2="12" y2="19"/>
+                  <line x1="5" y1="12" x2="19" y2="12"/>
+                </svg>
+                Add Schedule
+              </button>
+            </div>
+
+            <div id="schedulesList" class="schedules-list">
+              <p class="no-schedules">No scheduled syncs. Add a time above to get started.</p>
+            </div>
+
+            <div id="nextScheduledSync" class="next-sync-info" style="display: none;">
+              <span class="next-sync-label">Next sync:</span>
+              <span class="next-sync-time" id="nextSyncTime">--:--</span>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <h2 class="section-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 20px; height: 20px; margin-right: 8px; vertical-align: middle;">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              Upload Settings
+            </h2>
+            <p class="settings-note" style="margin-bottom: 16px;">Share your stats with the web interface. No usernames or passwords are uploaded - only program names and stats numbers (FTDs, deposits, revenue totals).</p>
+
+            <div class="form-group" style="margin-bottom: 16px;">
+              <label class="checkbox-label">
+                <input type="checkbox" id="statsUploadEnabled">
+                <span>Upload Stats to Web Dashboard</span>
+              </label>
+              <p class="settings-note">After syncing, automatically send your stats to the web interface so you can view them from any device.</p>
+            </div>
+
+            <div class="form-group">
+              <label class="checkbox-label">
+                <input type="checkbox" id="templateSyncEnabled">
+                <span>Sync Template Additions</span>
+              </label>
+              <p class="settings-note">When you add a program from templates, mark it as "installed" on the web interface. Your existing programs are automatically synced when you open the Templates view.</p>
+            </div>
+          </div>
+
+          <div class="settings-section">
             <h2 class="section-title">Developer Settings</h2>
             <div class="form-group">
               <label class="checkbox-label">
@@ -397,6 +473,23 @@
               Clear All Stats
             </button>
             <p class="settings-note" style="margin-top: 12px;">Consolidate combines multiple daily records into single monthly totals.</p>
+          </div>
+
+          <div class="settings-section">
+            <h2 class="section-title">Backup & Restore</h2>
+            <div style="display: flex; gap: 12px; align-items: center;">
+              <button class="btn btn-primary" id="exportBackupBtn">
+                📦 Export Backup
+              </button>
+              <button class="btn btn-secondary" id="importBackupBtn">
+                📥 Import Backup
+              </button>
+            </div>
+            <p class="settings-note" style="margin-top: 12px;">
+              Export creates a complete backup including your database and encryption keys.<br>
+              All credentials remain encrypted and will work on import.
+            </p>
+            <p id="dataPathsInfo" class="settings-note" style="margin-top: 8px; font-family: monospace; font-size: 11px; color: var(--text-muted);"></p>
           </div>
         </div>
 
@@ -505,11 +598,8 @@
           </div>
           <div class="form-group">
             <label for="programLoginUrl">Login URL</label>
-            <input type="url" class="input" id="programLoginUrl" placeholder="https://...">
-          </div>
-          <div class="form-group">
-            <label for="programApiUrl">API URL (if applicable)</label>
-            <input type="url" class="input" id="programApiUrl" placeholder="https://...">
+            <input type="url" class="input" id="programLoginUrl" placeholder="https://affiliates.example.com">
+            <p class="form-hint">The main affiliate dashboard URL</p>
           </div>
 
           <div class="form-divider">
@@ -524,9 +614,20 @@
             <label for="credPassword">Password</label>
             <input type="password" class="input" id="credPassword" placeholder="Your password">
           </div>
+
+          <div class="form-divider">
+            <span>API Credentials (optional - for OAuth2/API access)</span>
+          </div>
+
           <div class="form-group">
-            <label for="credApiKey">API Key (if applicable)</label>
-            <input type="text" class="input" id="credApiKey" placeholder="API key">
+            <label for="credApiKey">Client ID / API Key</label>
+            <input type="text" class="input" id="credApiKey" placeholder="Client ID or API key">
+            <p class="form-hint">For MyAffiliates: Account → Authorisation → Client Identifier</p>
+          </div>
+          <div class="form-group">
+            <label for="credApiSecret">Client Secret</label>
+            <input type="password" class="input" id="credApiSecret" placeholder="Client secret (if required)">
+            <p class="form-hint">For MyAffiliates: The Client Secret from Authorisation</p>
           </div>
         </form>
       </div>

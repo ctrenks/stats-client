@@ -12,17 +12,7 @@ const EXCHANGE_RATES = {
 let defaultCurrency = "USD";
 
 // Built-in configured programs (always available)
-const BUILTIN_PROGRAMS = [
-  {
-    name: "7BitPartners",
-    code: "7bitpartners",
-    provider: "7BITPARTNERS",
-    authType: "API_KEY",
-    apiUrl: "https://dashboard.7bitpartners.com",
-    config: { apiUrl: "https://dashboard.7bitpartners.com" },
-    builtin: true,
-  },
-];
+const BUILTIN_PROGRAMS = [];
 
 // State
 let currentView = "dashboard";
@@ -70,6 +60,7 @@ const elements = {
   credUsername: document.getElementById("credUsername"),
   credPassword: document.getElementById("credPassword"),
   credApiKey: document.getElementById("credApiKey"),
+  credApiSecret: document.getElementById("credApiSecret"),
 
   // Stats view
   statsProgramSelect: document.getElementById("statsProgramSelect"),
@@ -104,6 +95,19 @@ document.addEventListener("DOMContentLoaded", async () => {
     showBrowserCheckbox.checked = showBrowser === "true";
   }
 
+  // Load upload settings
+  const statsUploadEnabled = await window.api.getSetting("statsUploadEnabled");
+  const statsUploadCheckbox = document.getElementById("statsUploadEnabled");
+  if (statsUploadCheckbox) {
+    statsUploadCheckbox.checked = statsUploadEnabled === "true";
+  }
+
+  const templateSyncEnabled = await window.api.getSetting("templateSyncEnabled");
+  const templateSyncCheckbox = document.getElementById("templateSyncEnabled");
+  if (templateSyncCheckbox) {
+    templateSyncCheckbox.checked = templateSyncEnabled === "true";
+  }
+
   // Load sync concurrency setting
   const syncConcurrency = await window.api.getSetting("syncConcurrency");
   const syncConcurrencySelect = document.getElementById("syncConcurrency");
@@ -124,6 +128,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupEventListeners();
   setupSyncListeners();
   renderTemplates(); // Show built-in configured programs
+  initSchedulerUI(); // Initialize scheduler
+  initSidebarSyncButton(); // Initialize sidebar sync button
+  await loadSchedules(); // Load scheduled syncs
 
   // Listen for security code input requests from main process
   window.api.onShowSecurityCodeInput((data) => {
@@ -185,6 +192,7 @@ function updateCredentialFields(provider, isEditMode = false) {
   const usernameGroup = elements.credUsername?.parentElement;
   const passwordGroup = elements.credPassword?.parentElement;
   const apiKeyGroup = elements.credApiKey?.parentElement;
+  const apiSecretGroup = elements.credApiSecret?.parentElement;
   const baseUrlGroup = elements.programApiUrl?.parentElement;
   const loginUrlGroup = elements.programLoginUrl?.parentElement;
   const descriptionEl = document.getElementById('providerDescription');
@@ -195,6 +203,7 @@ function updateCredentialFields(provider, isEditMode = false) {
   const usernameLabel = usernameGroup.querySelector('label');
   const passwordLabel = passwordGroup.querySelector('label');
   const apiKeyLabel = apiKeyGroup.querySelector('label');
+  const apiSecretLabel = apiSecretGroup?.querySelector('label');
   const baseUrlLabel = baseUrlGroup?.querySelector('label');
   const loginUrlLabel = loginUrlGroup?.querySelector('label');
 
@@ -202,9 +211,11 @@ function updateCredentialFields(provider, isEditMode = false) {
   usernameGroup.style.display = 'block';
   passwordGroup.style.display = 'block';
   apiKeyGroup.style.display = 'block';
+  if (apiSecretGroup) apiSecretGroup.style.display = 'none'; // Hidden by default
   if (usernameLabel) usernameLabel.textContent = 'Username';
   if (passwordLabel) passwordLabel.textContent = 'Password';
   if (apiKeyLabel) apiKeyLabel.textContent = 'API Key';
+  if (apiSecretLabel) apiSecretLabel.textContent = 'Client Secret';
   if (baseUrlLabel) baseUrlLabel.textContent = 'API URL';
   if (loginUrlLabel) loginUrlLabel.textContent = 'Login URL';
   if (descriptionEl) {
@@ -214,15 +225,22 @@ function updateCredentialFields(provider, isEditMode = false) {
 
   if (!provider) return;
 
+  // Check if OAuth is supported
+  const supportsOAuth = provider.supportsOAuth || provider.supports_oauth;
+
+  console.log('[DEBUG updateCredentialFields] provider:', provider);
+  console.log('[DEBUG updateCredentialFields] supportsOAuth:', supportsOAuth);
+  console.log('[DEBUG updateCredentialFields] apiSecretGroup exists:', !!apiSecretGroup);
+
   // Update field visibility based on authType
-  const authType = provider.authType || 'CREDENTIALS';
+  const authType = provider.authType || provider.auth_type || 'CREDENTIALS';
 
   if (authType === 'API_KEY') {
     // Only show API key field
     usernameGroup.style.display = 'none';
     passwordGroup.style.display = 'none';
     apiKeyGroup.style.display = 'block';
-    if (apiKeyLabel) apiKeyLabel.textContent = provider.apiKeyLabel || 'API Key / Token';
+    if (apiKeyLabel) apiKeyLabel.textContent = provider.apiKeyLabel || provider.api_key_label || 'API Key / Token';
   } else if (authType === 'CREDENTIALS') {
     // Only show username/password
     usernameGroup.style.display = 'block';
@@ -233,29 +251,60 @@ function updateCredentialFields(provider, isEditMode = false) {
     usernameGroup.style.display = 'block';
     passwordGroup.style.display = 'block';
     apiKeyGroup.style.display = 'block';
-    if (apiKeyLabel) apiKeyLabel.textContent = provider.apiKeyLabel || 'API Key (optional if using login)';
+    if (apiKeyLabel) apiKeyLabel.textContent = provider.apiKeyLabel || provider.api_key_label || 'API Key (optional if using login)';
+
+    // CellXpert-specific help text
+    const providerCode = provider.code || provider.provider || '';
+    if (providerCode.toUpperCase() === 'CELLXPERT' && descriptionEl) {
+      descriptionEl.innerHTML = `
+        <strong>🚀 API Recommended (faster & more accurate):</strong><br>
+        • <strong>Username:</strong> Your Affiliate ID number (find in CellXpert dashboard)<br>
+        • <strong>API Key:</strong> Your x-api-key from CellXpert<br>
+        • Leave Password empty<br><br>
+        <em>📋 Scraping fallback:</em> Use email + password (no API key)
+      `;
+      descriptionEl.style.display = 'block';
+      descriptionEl.style.marginBottom = '15px';
+      descriptionEl.style.padding = '10px';
+      descriptionEl.style.backgroundColor = 'rgba(100, 200, 100, 0.1)';
+      descriptionEl.style.borderRadius = '6px';
+      descriptionEl.style.fontSize = '0.85rem';
+      descriptionEl.style.lineHeight = '1.5';
+    }
+  }
+
+  // Show API Secret field if OAuth is supported
+  if (supportsOAuth && apiSecretGroup) {
+    apiSecretGroup.style.display = 'block';
+    apiKeyGroup.style.display = 'block'; // Always show API key/Client ID for OAuth
+    if (apiKeyLabel) apiKeyLabel.textContent = provider.apiKeyLabel || provider.api_key_label || 'Client ID';
+    if (apiSecretLabel) apiSecretLabel.textContent = provider.apiSecretLabel || provider.api_secret_label || 'Client Secret';
   }
 
   // Update custom labels if provided
-  if (provider.usernameLabel && usernameLabel) {
-    usernameLabel.textContent = provider.usernameLabel;
+  if ((provider.usernameLabel || provider.username_label) && usernameLabel) {
+    usernameLabel.textContent = provider.usernameLabel || provider.username_label;
   }
-  if (provider.passwordLabel && passwordLabel) {
-    passwordLabel.textContent = provider.passwordLabel;
+  if ((provider.passwordLabel || provider.password_label) && passwordLabel) {
+    passwordLabel.textContent = provider.passwordLabel || provider.password_label;
   }
-  if (provider.apiKeyLabel && apiKeyLabel) {
-    apiKeyLabel.textContent = provider.apiKeyLabel;
+  if ((provider.apiKeyLabel || provider.api_key_label) && apiKeyLabel) {
+    apiKeyLabel.textContent = provider.apiKeyLabel || provider.api_key_label;
   }
-  if (provider.baseUrlLabel && baseUrlLabel) {
-    baseUrlLabel.textContent = provider.baseUrlLabel;
+  if ((provider.apiSecretLabel || provider.api_secret_label) && apiSecretLabel) {
+    apiSecretLabel.textContent = provider.apiSecretLabel || provider.api_secret_label;
+  }
+  if ((provider.baseUrlLabel || provider.base_url_label) && baseUrlLabel) {
+    baseUrlLabel.textContent = provider.baseUrlLabel || provider.base_url_label;
   }
 
   // Show/hide base URL field based on requiresBaseUrl
   if (baseUrlGroup) {
     // Show if required, or if provider has a default baseUrl, or always show for flexibility
     baseUrlGroup.style.display = 'block';
-    if (provider.requiresBaseUrl && baseUrlLabel) {
-      baseUrlLabel.textContent = (provider.baseUrlLabel || 'Affiliate Dashboard URL') + ' *';
+    const requiresBaseUrl = provider.requiresBaseUrl || provider.requires_base_url;
+    if (requiresBaseUrl && baseUrlLabel) {
+      baseUrlLabel.textContent = ((provider.baseUrlLabel || provider.base_url_label) || 'Affiliate Dashboard URL') + ' *';
     }
   }
 
@@ -319,16 +368,21 @@ async function loadDashboardData() {
           const rate = EXCHANGE_RATES[stat.currency]?.[defaultCurrency] || 1;
           revenue = revenue * rate;
         }
-        totalRevenue += revenue;
+        // Only count positive revenue - negative means no payment, not deduction
+        if (revenue > 0) {
+          totalRevenue += revenue;
+        }
       }
     }
 
     elements.currentMonthFTDs.textContent = totalFTDs.toLocaleString();
+    // Hide cents for values over $10K to save space
+    const showCents = totalRevenue < 10000;
     elements.currentMonthRevenue.textContent = `${
       CURRENCY_SYMBOLS[defaultCurrency] || "$"
     }${totalRevenue.toLocaleString("en-US", {
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
+      minimumFractionDigits: showCents ? 2 : 0,
+      maximumFractionDigits: showCents ? 2 : 0,
     })}`;
   } catch (error) {
     console.error("Error loading current month stats:", error);
@@ -475,9 +529,18 @@ function createFreshModal() {
           <label for="credPassword">Password</label>
           <input type="password" class="input" id="credPassword" placeholder="Login password">
         </div>
+        <div class="form-divider">
+          <span>API Credentials (optional - for OAuth2/API access)</span>
+        </div>
         <div class="form-group">
-          <label for="credApiKey">API Key</label>
-          <input type="text" class="input" id="credApiKey" placeholder="API key if required">
+          <label for="credApiKey">Client ID / API Key</label>
+          <input type="text" class="input" id="credApiKey" placeholder="Client ID or API key">
+          <p class="form-hint">For MyAffiliates: Account → Authorisation → Client Identifier</p>
+        </div>
+        <div class="form-group">
+          <label for="credApiSecret">Client Secret</label>
+          <input type="password" class="input" id="credApiSecret" placeholder="Client secret (if required)">
+          <p class="form-hint">For MyAffiliates: The Client Secret from Authorisation</p>
         </div>
       </form>
     </div>
@@ -503,6 +566,7 @@ function createFreshModal() {
   elements.credUsername = document.getElementById("credUsername");
   elements.credPassword = document.getElementById("credPassword");
   elements.credApiKey = document.getElementById("credApiKey");
+  elements.credApiSecret = document.getElementById("credApiSecret");
 
   // Populate provider dropdown
   if (providers.length > 0) {
@@ -584,7 +648,7 @@ async function loadPrograms() {
   updateProgramsSelect();
 }
 
-// Render programs list (sorted alphabetically)
+// Render programs list (sorted by status: needs setup → errors → working)
 function renderPrograms() {
   if (programs.length === 0) {
     elements.programsList.innerHTML = `
@@ -601,10 +665,26 @@ function renderPrograms() {
     return;
   }
 
-  // Sort programs alphabetically by name
-  const sortedPrograms = [...programs].sort((a, b) =>
-    a.name.toLowerCase().localeCompare(b.name.toLowerCase())
-  );
+  // Sort programs by status priority, then alphabetically within each group
+  // Priority: 1. No credentials (needs setup), 2. Has errors, 3. Working
+  const sortedPrograms = [...programs].sort((a, b) => {
+    // Get status priority (lower = higher priority = shown first)
+    const getPriority = (p) => {
+      if (!p.has_credentials) return 1; // Needs setup
+      if (p.last_error) return 2;       // Has errors
+      return 3;                          // Working
+    };
+
+    const priorityA = getPriority(a);
+    const priorityB = getPriority(b);
+
+    if (priorityA !== priorityB) {
+      return priorityA - priorityB;
+    }
+
+    // Same priority, sort alphabetically
+    return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+  });
 
   elements.programsList.innerHTML = renderProgramCards(sortedPrograms);
   attachProgramEventHandlers();
@@ -618,9 +698,11 @@ function renderProgramCards(programList) {
         ? new Date(p.last_sync).toLocaleDateString()
         : "Never";
       const hasError = p.last_error ? "has-error" : "";
+      const needsSetup = !p.has_credentials ? "needs-setup" : "";
+      const cardClass = `program-card ${hasError} ${needsSetup}`.trim();
 
       return `
-    <div class="program-card ${hasError}" data-id="${p.id}">
+    <div class="${cardClass}" data-id="${p.id}">
       <div class="program-info">
         <span class="program-name">${escapeHtml(p.name)}</span>
         <div class="program-meta">
@@ -631,13 +713,18 @@ function renderProgramCards(programList) {
           <span class="program-sync-status">Last sync: ${lastSync}</span>
         </div>
         ${
+          !p.has_credentials
+            ? `<div class="program-warning">⚠️ Needs credentials - click Edit to add login info</div>`
+            : ""
+        }
+        ${
           p.last_error
             ? `<div class="program-error">${escapeHtml(p.last_error)}</div>`
             : ""
         }
       </div>
       <div class="program-actions">
-        <button class="btn btn-sm sync-btn" data-id="${p.id}" title="Sync this program">
+        <button class="btn btn-sm sync-btn" data-id="${p.id}" title="Sync this program" ${!p.has_credentials ? 'disabled' : ''}>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">
             <path d="M23 4v6h-6"/>
             <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
@@ -730,24 +817,109 @@ async function fetchTemplates() {
 
 // Render templates (configured programs)
 function renderTemplates() {
-  // Merge built-in with fetched templates
-  const allTemplates = [...BUILTIN_PROGRAMS];
+  // Merge templates - prefer server templates over built-ins (server has isSelected, referralUrl)
+  const allTemplates = [...templates];
 
-  // Add server templates that aren't duplicates
-  templates.forEach((t) => {
-    if (!allTemplates.find((b) => b.code === t.code)) {
-      allTemplates.push(t);
+  // Add built-in templates only if not already fetched from server
+  BUILTIN_PROGRAMS.forEach((b) => {
+    if (!allTemplates.find((t) => t.code === b.code || t.name === b.name)) {
+      allTemplates.push(b);
     }
   });
 
   // Filter out templates that are already set up as programs
-  const availableTemplates = allTemplates.filter((t) => {
+  let availableTemplates = allTemplates.filter((t) => {
     // Check if this template code is already used by any existing program
     return !programs.some((p) => p.code === t.code || p.name === t.name);
   });
 
-  if (availableTemplates.length === 0) {
+  // Get unique software types for filter dropdown
+  const softwareTypes = [...new Set(availableTemplates.map(t => t.provider).filter(Boolean))].sort();
+
+  // Apply search filter
+  if (templateSearchQuery) {
+    const query = templateSearchQuery.toLowerCase();
+    availableTemplates = availableTemplates.filter(t =>
+      t.name.toLowerCase().includes(query) ||
+      (t.provider && t.provider.toLowerCase().includes(query))
+    );
+  }
+
+  // Apply "web selected only" filter
+  if (templateWebSelectedOnly) {
+    availableTemplates = availableTemplates.filter(t => t.isSelected);
+  }
+
+  // Apply software filter
+  if (templateSoftwareFilter) {
+    availableTemplates = availableTemplates.filter(t => t.provider === templateSoftwareFilter);
+  }
+
+  // Sort templates
+  availableTemplates.sort((a, b) => {
+    let aVal, bVal;
+    switch (templateSortColumn) {
+      case "name":
+        aVal = (a.name || "").toLowerCase();
+        bVal = (b.name || "").toLowerCase();
+        break;
+      case "software":
+        aVal = (a.provider || "").toLowerCase();
+        bVal = (b.provider || "").toLowerCase();
+        break;
+      default:
+        aVal = (a.name || "").toLowerCase();
+        bVal = (b.name || "").toLowerCase();
+    }
+    if (aVal < bVal) return templateSortDirection === "asc" ? -1 : 1;
+    if (aVal > bVal) return templateSortDirection === "asc" ? 1 : -1;
+    return 0;
+  });
+
+  // Build sort icon helper
+  const getSortIcon = (col) => {
+    if (templateSortColumn !== col) return '<span class="sort-icon">⇅</span>';
+    return templateSortDirection === "asc"
+      ? '<span class="sort-icon active">▲</span>'
+      : '<span class="sort-icon active">▼</span>';
+  };
+
+  // Count web-selected templates
+  const webSelectedCount = availableTemplates.filter(t => t.isSelected).length;
+
+  // Build filter bar HTML
+  const filterBarHtml = `
+    <div class="templates-filter-bar">
+      <div class="search-box">
+        <input type="text" id="templateSearch" placeholder="Search programs..." value="${escapeHtml(templateSearchQuery)}">
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/>
+          <path d="M21 21l-4.35-4.35"/>
+        </svg>
+      </div>
+      <select id="templateSoftwareFilter" class="select">
+        <option value="">All Software</option>
+        ${softwareTypes.map(sw => `<option value="${escapeHtml(sw)}" ${templateSoftwareFilter === sw ? 'selected' : ''}>${escapeHtml(sw)}</option>`).join('')}
+      </select>
+      <label class="checkbox-filter">
+        <input type="checkbox" id="webSelectedFilter" ${templateWebSelectedOnly ? 'checked' : ''}>
+        <span>Web Selected (${webSelectedCount})</span>
+      </label>
+      <div class="sort-buttons">
+        <button class="btn btn-sm ${templateSortColumn === 'name' ? 'btn-primary' : 'btn-secondary'}" id="sortByName">
+          Name ${getSortIcon('name')}
+        </button>
+        <button class="btn btn-sm ${templateSortColumn === 'software' ? 'btn-primary' : 'btn-secondary'}" id="sortBySoftware">
+          Software ${getSortIcon('software')}
+        </button>
+      </div>
+      <span class="template-count">${availableTemplates.length} available</span>
+    </div>
+  `;
+
+  if (availableTemplates.length === 0 && !templateSearchQuery && !templateSoftwareFilter) {
     elements.templatesList.innerHTML = `
+      ${filterBarHtml}
       <div class="empty-state">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
           <path d="M12 2L2 7l10 5 10-5-10-5z"/>
@@ -758,44 +930,147 @@ function renderTemplates() {
         <p>All configured programs have already been imported</p>
       </div>
     `;
+    attachTemplateFilterHandlers();
     return;
   }
 
-  // Sort templates alphabetically and use filtered list
-  templates = availableTemplates.sort((a, b) =>
-    a.name.toLowerCase().localeCompare(b.name.toLowerCase())
-  );
-
-  elements.templatesList.innerHTML = templates
-    .map((t, index) => {
-      const icon = t.icon || '';
-      const description = t.description || '';
-
-      return `
-    <div class="template-card">
-      <div class="template-header">
-        <span class="template-name">${icon ? icon + ' ' : ''}${escapeHtml(t.name)}</span>
-        <span class="template-provider">${escapeHtml(t.provider)}</span>
+  if (availableTemplates.length === 0) {
+    elements.templatesList.innerHTML = `
+      ${filterBarHtml}
+      <div class="empty-state">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <circle cx="11" cy="11" r="8"/>
+          <path d="M21 21l-4.35-4.35"/>
+        </svg>
+        <h3>No Results</h3>
+        <p>No programs match your search criteria</p>
       </div>
-      ${description ? `<div class="template-description">${escapeHtml(description)}</div>` : ''}
-      <button class="btn btn-sm btn-primary import-btn" data-index="${index}">
-        Import
-      </button>
+    `;
+    attachTemplateFilterHandlers();
+    return;
+  }
+
+  // Store sorted templates for import handler
+  const displayedTemplates = availableTemplates;
+
+  elements.templatesList.innerHTML = filterBarHtml + `
+    <div class="templates-grid">
+      ${displayedTemplates.map((t, index) => {
+        const icon = t.icon || '';
+        const description = t.description || '';
+        const referralUrl = t.referralUrl || '';
+        const isSelectedOnWeb = t.isSelected || false;
+
+        return `
+          <div class="template-card${isSelectedOnWeb ? ' selected-on-web' : ''}">
+            <div class="template-header">
+              <div class="template-name-row">
+                <span class="template-name">${icon ? icon + ' ' : ''}${escapeHtml(t.name)}</span>
+                ${referralUrl ? `
+                  <a href="${escapeHtml(referralUrl)}" target="_blank" class="btn-signup-inline" title="Sign up for this program">
+                    Sign Up
+                  </a>
+                ` : ''}
+                ${isSelectedOnWeb ? '<span class="web-selected-badge">★ Web</span>' : ''}
+              </div>
+              <span class="template-provider">${escapeHtml(t.provider)}</span>
+            </div>
+            ${description ? `<div class="template-description">${escapeHtml(description)}</div>` : ''}
+            <div class="template-actions">
+              <button class="btn btn-sm btn-primary import-btn" data-code="${escapeHtml(t.code)}">
+                Import
+              </button>
+            </div>
+          </div>
+        `;
+      }).join('')}
     </div>
   `;
-    })
-    .join("");
+
+  // Store displayed templates globally for import handler
+  window._displayedTemplates = displayedTemplates;
 
   // Add click handlers for import buttons
   document.querySelectorAll(".import-btn").forEach((btn) => {
     btn.addEventListener("click", async (e) => {
-      const index = parseInt(e.target.dataset.index);
-      const template = templates[index];
+      const code = e.target.dataset.code;
+      const template = window._displayedTemplates.find(t => t.code === code);
       if (template) {
         await importTemplate(template);
       }
     });
   });
+
+  // Add click handlers for signup buttons
+  document.querySelectorAll(".signup-btn").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      const url = e.currentTarget.dataset.url;
+      if (url) {
+        window.api.openExternal(url);
+      }
+    });
+  });
+
+  attachTemplateFilterHandlers();
+}
+
+// Attach filter handlers for templates
+function attachTemplateFilterHandlers() {
+  const searchInput = document.getElementById("templateSearch");
+  const softwareSelect = document.getElementById("templateSoftwareFilter");
+  const sortByNameBtn = document.getElementById("sortByName");
+  const sortBySoftwareBtn = document.getElementById("sortBySoftware");
+
+  if (searchInput) {
+    // Debounce search
+    let searchTimeout;
+    searchInput.addEventListener("input", (e) => {
+      clearTimeout(searchTimeout);
+      searchTimeout = setTimeout(() => {
+        templateSearchQuery = e.target.value;
+        renderTemplates();
+      }, 300);
+    });
+  }
+
+  if (softwareSelect) {
+    softwareSelect.addEventListener("change", (e) => {
+      templateSoftwareFilter = e.target.value;
+      renderTemplates();
+    });
+  }
+
+  const webSelectedCheckbox = document.getElementById("webSelectedFilter");
+  if (webSelectedCheckbox) {
+    webSelectedCheckbox.addEventListener("change", (e) => {
+      templateWebSelectedOnly = e.target.checked;
+      renderTemplates();
+    });
+  }
+
+  if (sortByNameBtn) {
+    sortByNameBtn.addEventListener("click", () => {
+      if (templateSortColumn === "name") {
+        templateSortDirection = templateSortDirection === "asc" ? "desc" : "asc";
+      } else {
+        templateSortColumn = "name";
+        templateSortDirection = "asc";
+      }
+      renderTemplates();
+    });
+  }
+
+  if (sortBySoftwareBtn) {
+    sortBySoftwareBtn.addEventListener("click", () => {
+      if (templateSortColumn === "software") {
+        templateSortDirection = templateSortDirection === "asc" ? "desc" : "asc";
+      } else {
+        templateSortColumn = "software";
+        templateSortDirection = "asc";
+      }
+      renderTemplates();
+    });
+  }
 }
 
 // Import template
@@ -870,9 +1145,45 @@ async function editProgram(id) {
   elements.programLoginUrl.value = program.login_url || "";
   elements.programApiUrl.value = program.api_url || "";
 
-  // Update credential field visibility based on provider (edit mode - don't overwrite URLs)
-  const provider = providers.find(p => p.code === program.provider);
-  updateCredentialFields(provider, true);
+  // Update credential field visibility based on program's own auth_type
+  // Create a provider object with the program's stored authType and config settings
+  const providerInfo = providers.find(p => p.code === program.provider) || {};
+
+  console.log('[DEBUG] Program provider code:', program.provider);
+  console.log('[DEBUG] Available providers:', providers.map(p => p.code));
+  console.log('[DEBUG] Found providerInfo:', providerInfo);
+
+  // Parse config if it's a string
+  let programConfig = {};
+  if (program.config) {
+    try {
+      programConfig = typeof program.config === 'string' ? JSON.parse(program.config) : program.config;
+    } catch (e) {
+      console.warn('Could not parse program config:', e);
+    }
+  }
+
+  console.log('[DEBUG] Parsed programConfig:', programConfig);
+  console.log('[DEBUG] programConfig.supportsOAuth:', programConfig.supportsOAuth);
+  console.log('[DEBUG] providerInfo.supportsOAuth:', providerInfo.supportsOAuth);
+
+  const programWithAuthType = {
+    ...providerInfo,
+    authType: program.auth_type || providerInfo.authType || 'CREDENTIALS',
+    // Include OAuth and label settings from stored config
+    supportsOAuth: programConfig.supportsOAuth || providerInfo.supportsOAuth,
+    apiKeyLabel: programConfig.apiKeyLabel || providerInfo.apiKeyLabel,
+    apiSecretLabel: programConfig.apiSecretLabel || providerInfo.apiSecretLabel,
+    usernameLabel: programConfig.usernameLabel || providerInfo.usernameLabel,
+    passwordLabel: programConfig.passwordLabel || providerInfo.passwordLabel,
+    baseUrlLabel: programConfig.baseUrlLabel || providerInfo.baseUrlLabel,
+    requiresBaseUrl: programConfig.requiresBaseUrl || providerInfo.requiresBaseUrl,
+  };
+
+  console.log('[DEBUG] Final programWithAuthType:', programWithAuthType);
+  console.log('[DEBUG] supportsOAuth being passed:', programWithAuthType.supportsOAuth);
+
+  updateCredentialFields(programWithAuthType, true);
 
   // Load credentials
   try {
@@ -881,6 +1192,9 @@ async function editProgram(id) {
       elements.credUsername.value = creds.username || "";
       elements.credPassword.value = creds.password || "";
       elements.credApiKey.value = creds.apiKey || "";
+      if (elements.credApiSecret) {
+        elements.credApiSecret.value = creds.apiSecret || "";
+      }
     }
   } catch (e) {
     log(`Could not load credentials: ${e.message}`, "warn");
@@ -1006,9 +1320,10 @@ async function saveProgram() {
       username: elements.credUsername.value.trim(),
       password: elements.credPassword.value.trim(),
       apiKey: elements.credApiKey.value.trim(),
+      apiSecret: elements.credApiSecret?.value?.trim() || "",
     };
 
-    if (credentials.username || credentials.password || credentials.apiKey) {
+    if (credentials.username || credentials.password || credentials.apiKey || credentials.apiSecret) {
       await window.api.saveCredentials(savedProgram.id, credentials);
     }
 
@@ -1104,6 +1419,13 @@ function setDateRange(range) {
 let currentStats = [];
 let sortColumn = "date";
 let sortDirection = "desc";
+
+// Global templates state for sorting/filtering
+let templateSortColumn = "name";
+let templateSortDirection = "asc";
+let templateSearchQuery = "";
+let templateSoftwareFilter = "";
+let templateWebSelectedOnly = false;
 
 // Load stats for program(s)
 async function loadStats() {
@@ -1421,6 +1743,16 @@ function setupEventListeners() {
     .getElementById("clearAllStatsBtn")
     .addEventListener("click", clearAllStats);
   document
+    .getElementById("exportBackupBtn")
+    .addEventListener("click", exportBackup);
+  document
+    .getElementById("importBackupBtn")
+    .addEventListener("click", importBackup);
+
+  // Show data paths on settings load
+  loadDataPaths();
+
+  document
     .getElementById("defaultCurrency")
     .addEventListener("change", async (e) => {
       defaultCurrency = e.target.value;
@@ -1444,6 +1776,42 @@ function setupEventListeners() {
         `Browser visibility ${
           e.target.checked ? "enabled" : "disabled"
         } - restart app to apply`,
+        "info"
+      );
+    });
+
+  // Stats upload setting
+  document
+    .getElementById("statsUploadEnabled")
+    .addEventListener("change", async (e) => {
+      await window.api.setSetting(
+        "statsUploadEnabled",
+        e.target.checked.toString()
+      );
+      showToast(
+        `Stats upload ${e.target.checked ? "enabled" : "disabled"}`,
+        "success"
+      );
+      log(
+        `Stats upload ${e.target.checked ? "enabled" : "disabled"}`,
+        "info"
+      );
+    });
+
+  // Template sync setting
+  document
+    .getElementById("templateSyncEnabled")
+    .addEventListener("change", async (e) => {
+      await window.api.setSetting(
+        "templateSyncEnabled",
+        e.target.checked.toString()
+      );
+      showToast(
+        `Template sync ${e.target.checked ? "enabled" : "disabled"}`,
+        "success"
+      );
+      log(
+        `Template sync ${e.target.checked ? "enabled" : "disabled"}`,
         "info"
       );
     });
@@ -1652,6 +2020,10 @@ async function syncAllPrograms() {
     // Refresh data
     await loadDashboardData();
     await loadPrograms();
+    // Also refresh stats view if it's visible
+    if (document.getElementById('statsView')?.classList.contains('active')) {
+      await loadStats();
+    }
   } catch (error) {
     log("Sync error: " + error.message, "error");
     showToast("Sync error: " + error.message, "error");
@@ -1677,12 +2049,11 @@ async function syncProgram(programId) {
   const program = programs.find((p) => p.id === programId);
   if (!program) return;
 
-  const programIndex = programs.indexOf(program);
   log(`Starting sync for ${program.name}...`, "info");
 
-  // Find and update the specific program's sync button
+  // Find and update the specific program's sync button by data-id
   const getSyncButton = () =>
-    document.querySelector(`.sync-btn[data-index="${programIndex}"]`);
+    document.querySelector(`.sync-btn[data-id="${programId}"]`);
 
   let syncButton = getSyncButton();
   if (syncButton) {
@@ -1703,6 +2074,10 @@ async function syncProgram(programId) {
 
     await loadPrograms();
     await loadDashboardData();
+    // Also refresh stats view if it's visible
+    if (document.getElementById('statsView')?.classList.contains('active')) {
+      await loadStats();
+    }
   } catch (error) {
     log("Sync error: " + error.message, "error");
     showToast("Sync error: " + error.message, "error");
@@ -1801,6 +2176,80 @@ async function clearAllStats() {
   } catch (error) {
     log("Failed to clear stats: " + error.message, "error");
     showToast("Failed to clear stats", "error");
+  }
+}
+
+// Export backup (database + encryption key)
+async function exportBackup() {
+  try {
+    log("Exporting backup...", "info");
+    const result = await window.api.exportBackup();
+
+    if (result.cancelled) {
+      log("Backup export cancelled", "info");
+      return;
+    }
+
+    if (result.success) {
+      log(`Backup exported to: ${result.path}`, "success");
+      showToast("Backup exported successfully!", "success");
+    } else {
+      log(`Backup export failed: ${result.error}`, "error");
+      showToast("Failed to export backup: " + result.error, "error");
+    }
+  } catch (error) {
+    log("Failed to export backup: " + error.message, "error");
+    showToast("Failed to export backup", "error");
+  }
+}
+
+// Import backup (database + encryption key)
+async function importBackup() {
+  if (
+    !confirm(
+      "Importing a backup will REPLACE all your current data.\n\nThis includes:\n• All programs\n• All credentials\n• All stats\n\nAre you sure you want to continue?"
+    )
+  ) {
+    return;
+  }
+
+  try {
+    log("Importing backup...", "info");
+    const result = await window.api.importBackup();
+
+    if (result.cancelled) {
+      log("Backup import cancelled", "info");
+      return;
+    }
+
+    if (result.success) {
+      log(`Backup imported successfully (from ${result.createdAt})`, "success");
+      showToast("Backup imported! Refreshing data...", "success");
+
+      // Reload all data
+      await loadDashboardData();
+      await loadPrograms();
+      await renderTemplates();
+    } else {
+      log(`Backup import failed: ${result.error}`, "error");
+      showToast("Failed to import backup: " + result.error, "error");
+    }
+  } catch (error) {
+    log("Failed to import backup: " + error.message, "error");
+    showToast("Failed to import backup", "error");
+  }
+}
+
+// Load and display data paths
+async function loadDataPaths() {
+  try {
+    const paths = await window.api.getDataPaths();
+    const infoEl = document.getElementById("dataPathsInfo");
+    if (infoEl && paths) {
+      infoEl.innerHTML = `Data location: ${paths.userDataPath}`;
+    }
+  } catch (error) {
+    console.error("Failed to load data paths:", error);
   }
 }
 
@@ -2219,5 +2668,160 @@ async function togglePaymentStatus(programId, month) {
     showToast("Payment status updated", "success");
   } catch (error) {
     showToast("Failed to update payment: " + error.message, "error");
+  }
+}
+
+// =====================
+// Scheduler Functions
+// =====================
+
+// Load and render schedules
+async function loadSchedules() {
+  const schedules = await window.api.getSchedules();
+  const list = document.getElementById('schedulesList');
+
+  if (schedules.length === 0) {
+    list.innerHTML = '<p class="no-schedules">No scheduled syncs. Add a time above to get started.</p>';
+    document.getElementById('nextScheduledSync').style.display = 'none';
+    return;
+  }
+
+  list.innerHTML = schedules.map(s => `
+    <div class="schedule-item ${s.enabled ? '' : 'disabled'}" data-id="${s.id}">
+      <div class="schedule-time">${formatTime12h(s.time)}</div>
+      <div class="schedule-actions">
+        <button class="btn btn-sm ${s.enabled ? 'btn-secondary' : 'btn-primary'} toggle-schedule-btn" data-id="${s.id}">
+          ${s.enabled ? 'Disable' : 'Enable'}
+        </button>
+        <button class="btn btn-sm btn-danger remove-schedule-btn" data-id="${s.id}">
+          Remove
+        </button>
+      </div>
+    </div>
+  `).join('');
+
+  // Attach event handlers
+  list.querySelectorAll('.toggle-schedule-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const id = e.target.dataset.id;
+      await window.api.toggleSchedule(id);
+      await loadSchedules();
+      showToast('Schedule updated', 'success');
+    });
+  });
+
+  list.querySelectorAll('.remove-schedule-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      const id = e.target.dataset.id;
+      await window.api.removeSchedule(id);
+      await loadSchedules();
+      showToast('Schedule removed', 'success');
+    });
+  });
+
+  // Update next sync display
+  await updateNextSyncDisplay();
+}
+
+// Format 24h time to 12h format
+function formatTime12h(time24) {
+  const [h, m] = time24.split(':');
+  const hour = parseInt(h);
+  const ampm = hour >= 12 ? 'PM' : 'AM';
+  const hour12 = hour % 12 || 12;
+  return `${hour12}:${m} ${ampm}`;
+}
+
+// Update the "next scheduled sync" display
+async function updateNextSyncDisplay() {
+  const nextSync = await window.api.getNextScheduledSync();
+  const container = document.getElementById('nextScheduledSync');
+  const timeEl = document.getElementById('nextSyncTime');
+
+  if (nextSync) {
+    const dayLabel = nextSync.isToday ? 'Today' : 'Tomorrow';
+    timeEl.textContent = `${dayLabel} at ${formatTime12h(nextSync.time)}`;
+    container.style.display = 'flex';
+  } else {
+    container.style.display = 'none';
+  }
+}
+
+// Add schedule
+async function addSchedule() {
+  const input = document.getElementById('scheduleTimeInput');
+  const time = input.value;
+
+  if (!time) {
+    showToast('Please select a time', 'error');
+    return;
+  }
+
+  const result = await window.api.addSchedule(time);
+
+  if (result.success) {
+    input.value = '';
+    await loadSchedules();
+    showToast(`Scheduled sync at ${formatTime12h(time)}`, 'success');
+  } else {
+    showToast(result.error || 'Failed to add schedule', 'error');
+  }
+}
+
+// Initialize scheduler UI
+function initSchedulerUI() {
+  // Add schedule button
+  const addBtn = document.getElementById('addScheduleBtn');
+  if (addBtn) {
+    addBtn.addEventListener('click', addSchedule);
+  }
+
+  // Allow Enter key in time input
+  const timeInput = document.getElementById('scheduleTimeInput');
+  if (timeInput) {
+    timeInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        addSchedule();
+      }
+    });
+  }
+
+  // Listen for scheduled sync events
+  window.api.onScheduledSyncStarted((data) => {
+    showToast(`Scheduled sync started (${formatTime12h(data.time)})`, 'info');
+    log(`Scheduled sync started at ${data.time}`, 'info');
+  });
+
+  window.api.onScheduledSyncCompleted((data) => {
+    showToast('Scheduled sync completed!', 'success');
+    loadDashboardData();
+    loadPrograms();
+  });
+}
+
+// Sidebar sync button handler
+function initSidebarSyncButton() {
+  const sidebarSyncBtn = document.getElementById('sidebarSyncBtn');
+  if (sidebarSyncBtn) {
+    sidebarSyncBtn.addEventListener('click', async () => {
+      sidebarSyncBtn.classList.add('syncing');
+      sidebarSyncBtn.disabled = true;
+
+      try {
+        await syncAllPrograms();
+      } finally {
+        sidebarSyncBtn.classList.remove('syncing');
+        sidebarSyncBtn.disabled = false;
+      }
+    });
+  }
+
+  // Help button - opens help page in browser
+  const helpBtn = document.getElementById('helpBtn');
+  if (helpBtn) {
+    helpBtn.addEventListener('click', () => {
+      // Open help page in default browser
+      window.api.openExternal('https://www.statsfetch.com/help');
+    });
   }
 }

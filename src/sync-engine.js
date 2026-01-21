@@ -132,12 +132,24 @@ class SyncEngine {
   }
 
   // Sync all active programs
-  async syncAll() {
-    const programs = this.db.getPrograms().filter(p => p.is_active);
+  // maxPrograms: limit how many programs to sync (for demo accounts)
+  async syncAll(maxPrograms = Infinity) {
+    let programs = this.db.getPrograms().filter(p => p.is_active);
 
     if (programs.length === 0) {
       this.log('No active programs to sync', 'warn');
       return { success: true, synced: 0, failed: 0, results: [] };
+    }
+
+    // If over program limit, only sync oldest programs (by created_at)
+    const totalActive = programs.length;
+    if (totalActive > maxPrograms) {
+      this.log(`⚠️ Program limit: ${totalActive} active programs, but limit is ${maxPrograms}. Syncing oldest ${maxPrograms} only.`, 'warn');
+      // Sort by created_at (oldest first) and take only maxPrograms
+      programs = programs
+        .sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0))
+        .slice(0, maxPrograms);
+      this.log(`Skipping ${totalActive - maxPrograms} newer programs. Upgrade to sync all.`, 'warn');
     }
 
     // Fetch exchange rates before syncing (cached for 24h)
@@ -257,11 +269,66 @@ class SyncEngine {
     // Exit batch mode
     this.inBatchMode = false;
 
-    // Note: Each program had its own isolated scraper which already closed itself
-    // No shared browser cleanup needed
-    this.log('All isolated browsers cleaned up');
+    // Close the main scraper if it was used (e.g., for Rival programs)
+    try {
+      if (this.scraper && this.scraper.isRunning()) {
+        this.log('Closing main scraper browser...');
+        await this.scraper.close();
+        this.log('Main scraper browser closed');
+      }
+    } catch (error) {
+      this.log(`Warning: Error closing main scraper: ${error.message}`, 'warn');
+    }
 
-    return { success: true, synced, failed, results };
+    this.log('All browsers cleaned up');
+
+    // Check if stats upload is enabled
+    const statsUploadEnabled = this.db.getSetting('statsUploadEnabled');
+    if (statsUploadEnabled === 'true') {
+      this.log('📤 Stats upload enabled - preparing data for web dashboard...');
+
+      // Gather monthly stats for all programs that synced successfully
+      const statsToUpload = [];
+      const now = new Date();
+      const currentMonth = now.toISOString().slice(0, 7); // YYYY-MM
+
+      for (const result of results) {
+        if (result.success) {
+          // Find the program to get its code and currency
+          const program = programs.find(p => p.name === result.program);
+          if (!program) continue;
+
+          // Get current month stats for this program
+          const startDate = `${currentMonth}-01`;
+          const endDate = now.toISOString().split('T')[0];
+          const stats = this.db.getStats(program.id, startDate, endDate);
+
+          // Aggregate stats for the month
+          const monthStats = stats.reduce((acc, s) => ({
+            clicks: acc.clicks + (s.clicks || 0),
+            impressions: acc.impressions + (s.impressions || 0),
+            signups: acc.signups + (s.signups || 0),
+            ftds: acc.ftds + (s.ftds || 0),
+            deposits: acc.deposits + (s.deposits || 0),
+            revenue: acc.revenue + (s.revenue || 0),
+          }), { clicks: 0, impressions: 0, signups: 0, ftds: 0, deposits: 0, revenue: 0 });
+
+          statsToUpload.push({
+            programName: program.name,
+            programCode: program.code,
+            month: currentMonth,
+            currency: program.currency || 'USD',
+            ...monthStats
+          });
+        }
+      }
+
+      // Store for upload by main process (can't do HTTP from here directly)
+      this.pendingStatsUpload = statsToUpload;
+      this.log(`📊 Prepared ${statsToUpload.length} programs for stats upload`);
+    }
+
+    return { success: true, synced, failed, results, pendingStatsUpload: this.pendingStatsUpload };
   }
 
   // Sync a single program
@@ -324,6 +391,8 @@ class SyncEngine {
       });
 
       // Save stats to database
+      // Channel records go to channel_stats table (with UPSERT)
+      // Aggregated records go to stats table (with UPSERT)
       let recordsSaved = 0;
       for (const stat of stats) {
         this.log(`Saving stat: ${JSON.stringify(stat)}`);
@@ -380,21 +449,26 @@ class SyncEngine {
   getProviderHandler(provider) {
     const handlers = {
       'CELLXPERT': this.syncCellxpert,
+      'CELLXPERT_API': this.syncCellxpertAPI,
       'CELLXPERT_SCRAPE': this.syncCellxpertScrape,
       'MYAFFILIATES': this.syncMyAffiliates,
       'MYAFFILIATES_SCRAPE': this.syncMyAffiliatesScrape,
       'INCOME_ACCESS': this.syncIncomeAccess,
       'NETREFER': this.syncNetrefer,
+      'EGO': this.syncEgo,
+      'MEXOS': this.syncMexos,
       'WYNTA': this.syncWynta,
       'AFFILKA': this.syncAffilka, // Generic Affilka handler
-      '7BITPARTNERS': this.sync7BitPartners,
-      '7BITPARTNERS_SCRAPE': this.sync7BitPartnersScrape,
+      'AFFILKA_API': this.syncAffilkaAPI,
+      'AFFILKA_SCRAPE': this.syncAffilkaScrape,
+      'ALANBASE': this.syncAlanbase,
       'WYNTA_SCRAPE': this.syncWyntaScrape,
       'DECKMEDIA': this.syncDeckMedia,
       'RTG': this.syncRTGNew,
       'RTG_ORIGINAL': this.syncRTG,
       'RIVAL': this.syncRival,
       'CASINO_REWARDS': this.syncCasinoRewards,
+      'NUMBER1AFFILIATES': this.syncNumber1Affiliates,
       'CUSTOM': this.syncCustom
     };
     return handlers[provider];
@@ -515,9 +589,20 @@ class SyncEngine {
     const password = credentials.password;
     const apiKey = credentials.apiKey;
 
-    // Check if this looks like a web interface (scraping needed) vs API
+    this.log(`CellXpert credentials check: username=${username ? 'set' : 'empty'}, password=${password ? 'set' : 'empty'}, apiKey=${apiKey ? 'set' : 'empty'}`);
+
+    // PREFER API: If we have API key, use the official API (username = affiliate ID)
+    if (apiKey) {
+      if (!username) {
+        throw new Error('CellXpert API requires your Affiliate ID number in the Username field (find it in your CellXpert dashboard)');
+      }
+      this.log('Using CellXpert official API (affiliateid + x-api-key) - preferred method');
+      return this.syncCellxpertAPI({ program, credentials, config, apiUrl: baseUrl || loginPath });
+    }
+
+    // Fallback to web scraping if no API key
     if (loginPath && (loginPath.includes('/partner/') || loginPath.includes('/login'))) {
-      this.log('This Cellxpert platform requires web scraping', 'info');
+      this.log('No API key provided, using web scraping fallback', 'info');
 
       // Use scraper
       try {
@@ -710,6 +795,138 @@ class SyncEngine {
     return dates;
   }
 
+  // CellXpert API - uses affiliateid + x-api-key headers
+  // Docs: https://cx-new-ui.cellxpert.com/api/?command=mediareport
+  async syncCellxpertAPI({ program, credentials, config, apiUrl }) {
+    const baseUrl = apiUrl || config?.apiUrl || config?.baseUrl;
+    const affiliateId = credentials.username; // Affiliate ID goes in username field
+    const apiKey = credentials.apiKey;
+
+    if (!baseUrl) {
+      throw new Error('CellXpert API requires a Base URL');
+    }
+
+    if (!affiliateId) {
+      throw new Error('CellXpert API requires Affiliate ID (enter in Username field)');
+    }
+
+    if (!apiKey) {
+      throw new Error('CellXpert API requires API Key');
+    }
+
+    // Clean up base URL
+    const cleanBaseUrl = baseUrl.replace(/\/+$/, '').replace(/\/api\/?$/, '');
+
+    // Get date ranges for current month and last month
+    const now = new Date();
+
+    // Current month
+    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const currentMonthEnd = now;
+
+    // Last month
+    const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+
+    // Helper to parse XML response
+    const parseXmlStats = (xmlText) => {
+      const results = {
+        impressions: 0,
+        clicks: 0,
+        signups: 0,
+        ftds: 0,
+        deposits: 0,
+        revenue: 0
+      };
+
+      // Parse XML rows
+      const rowMatches = xmlText.match(/<row>([\s\S]*?)<\/row>/gi) || [];
+
+      for (const row of rowMatches) {
+        // Extract values using regex
+        const getValue = (tag) => {
+          const match = row.match(new RegExp(`<${tag}>(.*?)<\/${tag}>`, 'i'));
+          return match ? parseFloat(match[1]) || 0 : 0;
+        };
+
+        results.impressions += getValue('Impressions');
+        results.clicks += getValue('Visitors') || getValue('Unique_Visitors');
+        results.signups += getValue('Leads') || getValue('Unique_Leads');
+        results.ftds += getValue('FTD');
+        results.deposits += getValue('Deposits');
+        results.revenue += getValue('Commission');
+      }
+
+      return results;
+    };
+
+    // Helper function to fetch stats for a date range
+    const fetchCellxpertStats = async (startDate, endDate, label) => {
+      const fromDate = this.formatDate(startDate);
+      const toDate = this.formatDate(endDate);
+
+      // Build API URL - use Day=1 breakdown for daily data, then aggregate
+      const url = `${cleanBaseUrl}/api/?command=mediareport&fromdate=${fromDate}&todate=${toDate}&Day=1`;
+
+      this.log(`Fetching CellXpert ${label}: ${fromDate} to ${toDate}`);
+
+      const response = await this.httpRequest(url, {
+        headers: {
+          'affiliateid': affiliateId,
+          'x-api-key': apiKey,
+          'Accept': '*/*'
+        }
+      });
+
+      if (response.status !== 200) {
+        throw new Error(`API returned status ${response.status}`);
+      }
+
+      const responseText = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+
+      // Check for error responses
+      if (responseText.includes('Bad Command') || responseText.includes('Bad Authentication')) {
+        throw new Error(`API Error: ${responseText}`);
+      }
+
+      // Parse XML response
+      const totals = parseXmlStats(responseText);
+
+      return {
+        date: this.formatDate(startDate),
+        clicks: totals.clicks,
+        impressions: totals.impressions,
+        signups: totals.signups,
+        ftds: totals.ftds,
+        deposits: Math.round(totals.deposits * 100), // Convert to cents
+        revenue: Math.round(totals.revenue * 100) // Convert to cents
+      };
+    };
+
+    // Fetch both months
+    const stats = [];
+
+    try {
+      const currentStats = await fetchCellxpertStats(currentMonthStart, currentMonthEnd, 'current month');
+      this.log(`Current month: clicks=${currentStats.clicks}, signups=${currentStats.signups}, ftds=${currentStats.ftds}, revenue=$${currentStats.revenue/100}`);
+      stats.push(currentStats);
+    } catch (e) {
+      this.log(`Failed to fetch current month: ${e.message}`);
+      throw e;
+    }
+
+    try {
+      const lastStats = await fetchCellxpertStats(lastMonthStart, lastMonthEnd, 'last month');
+      this.log(`Last month: clicks=${lastStats.clicks}, signups=${lastStats.signups}, ftds=${lastStats.ftds}, revenue=$${lastStats.revenue/100}`);
+      stats.push(lastStats);
+    } catch (e) {
+      this.log(`Failed to fetch last month: ${e.message}`);
+    }
+
+    this.log(`✓ CellXpert API sync complete: ${stats.length} month(s) fetched`);
+    return stats;
+  }
+
   // Cellxpert Scrape (web login)
   async syncCellxpertScrape({ program, credentials, config, loginUrl, statsUrl, scraper }) {
     const scr = scraper || this.scraper; // Use dedicated scraper for parallel safety
@@ -769,69 +986,320 @@ class SyncEngine {
     }
   }
 
+  // MyAffiliates OAuth2 token cache (in-memory)
+  myAffiliatesTokenCache = {};
+
+  // Get MyAffiliates OAuth2 access token
+  async getMyAffiliatesToken(domain, clientId, clientSecret) {
+    const cacheKey = `${domain}_${clientId}`;
+    const cached = this.myAffiliatesTokenCache[cacheKey];
+
+    // Check if we have a valid cached token (with 5 min buffer)
+    if (cached && cached.expiresAt > Date.now() + 300000) {
+      this.log('MyAffiliates - using cached access token');
+      return cached.accessToken;
+    }
+
+    this.log('MyAffiliates - requesting new access token');
+
+    const tokenUrl = `https://${domain}/oauth/access_token`;
+
+    try {
+      const response = await this.httpRequest(tokenUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: new URLSearchParams({
+          grant_type: 'client_credentials',
+          client_id: clientId,
+          client_secret: clientSecret,
+          scope: 'r_user_stats'
+        }).toString()
+      });
+
+      const data = response.data || response;
+
+      if (!data.access_token) {
+        throw new Error(`OAuth failed: ${JSON.stringify(data)}`);
+      }
+
+      // Cache the token
+      const expiresIn = data.expires_in || 3600;
+      this.myAffiliatesTokenCache[cacheKey] = {
+        accessToken: data.access_token,
+        expiresAt: Date.now() + (expiresIn * 1000)
+      };
+
+      this.log(`MyAffiliates - got access token, expires in ${expiresIn}s`);
+      return data.access_token;
+    } catch (error) {
+      this.log(`MyAffiliates OAuth error: ${error.message}`, 'error');
+      throw error;
+    }
+  }
+
+  // Parse MyAffiliates CSV response
+  parseMyAffiliatesCsv(csvText) {
+    const lines = csvText.trim().split('\n');
+    if (lines.length < 2) return [];
+
+    const headers = lines[0].split(',').map(h => h.trim().toLowerCase().replace(/['"]/g, ''));
+
+    // Store both per-channel records AND aggregated totals
+    const stats = [];
+    const monthlyTotals = {}; // For aggregated totals (no channel)
+
+    for (let i = 1; i < lines.length; i++) {
+      const values = lines[i].split(',').map(v => v.trim().replace(/['"]/g, ''));
+      const row = {};
+      headers.forEach((h, idx) => row[h] = values[idx] || '');
+
+      // Get channel name (casino/brand)
+      const channel = row.channel || row.brand || row.site || null;
+
+      // Get date/month
+      let dateVal = row.date || row['pay period'] || row.period || row.day || new Date().toISOString().split('T')[0];
+
+      // Skip header rows that got included (where date column contains non-date text)
+      if (dateVal && (dateVal.toLowerCase() === 'pay period' || dateVal.toLowerCase() === 'date')) {
+        continue; // Skip this row
+      }
+
+      // Ensure date is in YYYY-MM-DD format (use first of month if only YYYY-MM)
+      if (dateVal && dateVal.match(/^\d{4}-\d{2}$/)) {
+        dateVal = `${dateVal}-01`;
+      }
+
+      // Extract month key (YYYY-MM) for aggregation
+      const monthKey = dateVal ? dateVal.substring(0, 7) : new Date().toISOString().substring(0, 7);
+      const monthDate = `${monthKey}-01`;
+
+      // Parse values for this row
+      const clicks = parseInt(row.clicks || row.click || row.hits || row.unique_clicks || 0) || 0;
+      const impressions = parseInt(row.impressions || row.views || row.raw_clicks || 0) || 0;
+      const signups = parseInt(row.signups || row.registrations || row.regs || row.sign_ups || row['sign ups'] || 0) || 0;
+      const ftds = parseInt(row.ftds || row.ftd || row['first deposit count'] || row['first time depositors'] || row.new_depositors || row.ndc || 0) || 0;
+      // Deposits: "net deposits" is a currency value - convert to cents
+      const deposits = Math.round(parseFloat(row.deposits || row['net deposits'] || row['deposit total'] || row.deposit_count || 0) * 100) || 0;
+      // Try multiple possible revenue column names
+      // Note: "total ngr" = Total Net Gaming Revenue (common in MyAffiliates)
+      // Check columns in priority order - use the first one with a non-zero value
+      const revenueCandidates = [
+        row['total ngr'],    // Total Net Gaming Revenue - most specific
+        row.ngr,             // Net Gaming Revenue
+        row.income,
+        row.commission,
+        row.earnings,
+        row.revenue,
+        row['net revenue'],
+        row['net gaming'],
+        row.total,
+        row.payout,
+        row.amount,
+        row.share,
+        row['affiliate share'],
+        row['aff share'],
+        row['player value'],
+        row.pvr,
+        row.cpa,
+        row['rev share'],
+        row['rs'],
+        row['net income'],
+        row['monthly income'],
+        row['total earnings'],
+        row['your earnings'],
+        row['affiliate earnings']
+      ];
+
+      // Find the first non-zero value, or use the first available value
+      let revenueValue = 0;
+      for (const val of revenueCandidates) {
+        if (val !== undefined && val !== null && val !== '') {
+          const parsed = parseFloat(val);
+          if (!isNaN(parsed) && parsed !== 0) {
+            revenueValue = val;
+            break;
+          }
+          // Keep track of first non-null value even if zero
+          if (revenueValue === 0) revenueValue = val;
+        }
+      }
+      const revenue = Math.round(parseFloat(revenueValue) * 100) || 0;
+
+      // Save per-channel record (if channel exists)
+      if (channel) {
+        stats.push({
+          date: monthDate,
+          channel: channel,
+          clicks,
+          impressions,
+          signups,
+          ftds,
+          deposits,
+          revenue
+        });
+      }
+
+      // Also aggregate into monthly totals (for main display)
+      if (!monthlyTotals[monthKey]) {
+        monthlyTotals[monthKey] = {
+          date: monthDate,
+          channel: null, // Aggregated total has no channel
+          clicks: 0,
+          impressions: 0,
+          signups: 0,
+          ftds: 0,
+          deposits: 0,
+          revenue: 0
+        };
+      }
+
+      monthlyTotals[monthKey].clicks += clicks;
+      monthlyTotals[monthKey].impressions += impressions;
+      monthlyTotals[monthKey].signups += signups;
+      monthlyTotals[monthKey].ftds += ftds;
+      monthlyTotals[monthKey].deposits += deposits;
+      monthlyTotals[monthKey].revenue += revenue;
+    }
+
+    // Add aggregated totals to stats array
+    Object.values(monthlyTotals).forEach(total => stats.push(total));
+
+    // Log summary
+    const channelCount = stats.filter(s => s.channel).length;
+    const totalCount = stats.filter(s => !s.channel).length;
+    this.log(`MyAffiliates: ${channelCount} per-channel records + ${totalCount} monthly totals`);
+
+    // Log aggregated totals
+    Object.values(monthlyTotals).forEach(s =>
+      this.log(`  Total ${s.date}: clicks=${s.clicks}, signups=${s.signups}, ftds=${s.ftds}, deposits=${s.deposits/100}, revenue=${s.revenue/100}`)
+    );
+
+    return stats;
+  }
+
   // MyAffiliates - Auto-detect API vs Scraping
   async syncMyAffiliates({ program, credentials, config, apiUrl, loginUrl, statsUrl, scraper }) {
     const baseUrl = apiUrl || config?.apiUrl || config?.custom?.apiUrl || config?.baseUrl;
     const loginPath = loginUrl || config?.loginUrl;
     const statsPath = statsUrl || config?.statsUrl;
 
-    const apiKey = credentials.apiKey || credentials.token;
+    // OAuth2 credentials (Client ID and Client Secret)
+    const clientId = credentials.apiKey || credentials.clientId || credentials.token;
+    const clientSecret = credentials.apiSecret || credentials.clientSecret;
+
+    // Web scraping credentials
     const username = credentials.username;
     const password = credentials.password;
 
-    // Determine which method to use based on what credentials are provided
-    const hasApiKey = apiKey && apiKey.length > 0;
-    const hasCredentials = username && password;
+    // Determine which method to use
+    const hasOAuthCredentials = clientId && clientSecret;
+    const hasWebCredentials = username && password;
 
-    // If API key is provided, try API approach
-    if (hasApiKey && baseUrl) {
-      this.log('MyAffiliates - using API with key');
+    // Extract domain from baseUrl or loginUrl for OAuth
+    let domain = null;
+    if (baseUrl) {
+      try {
+        domain = new URL(baseUrl.startsWith('http') ? baseUrl : `https://${baseUrl}`).hostname;
+      } catch (e) {
+        domain = baseUrl.replace(/^https?:\/\//, '').split('/')[0];
+      }
+    } else if (loginPath) {
+      try {
+        domain = new URL(loginPath).hostname;
+      } catch (e) {}
+    }
 
-      const { startDate, endDate } = this.getDateRange(7);
-
-      // MyAffiliates API might use Bearer token or API key in header
-      const url = `${baseUrl}/api/reports/daily.json?startDate=${startDate}&endDate=${endDate}`;
+    // Try OAuth2 API first
+    if (hasOAuthCredentials && domain) {
+      this.log(`MyAffiliates - using OAuth2 API for ${domain}`);
 
       try {
-        const response = await this.httpRequest(url, {
-          headers: {
-            'Authorization': `Bearer ${apiKey}`,
-            'X-API-Key': apiKey,
-            'Content-Type': 'application/json'
-          }
-        });
+        // Get access token
+        const accessToken = await this.getMyAffiliatesToken(domain, clientId, clientSecret);
 
-        // Map MyAffiliates response to our stats format
-        const stats = [];
-        const data = response.data?.data || response.data?.reports || response.data;
+        // Fetch stats - using the Detailed Activity Report endpoint
+        // Get current month AND last month's data
+        const now = new Date();
+        const currentMonthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+        const currentMonthEnd = now.toISOString().split('T')[0];
 
-        if (Array.isArray(data)) {
-          for (const row of data) {
-            stats.push({
-              date: row.date || row.Date,
-              clicks: parseInt(row.clicks || row.Clicks || 0),
-              impressions: parseInt(row.impressions || row.Impressions || 0),
-              signups: parseInt(row.signups || row.Signups || row.registrations || 0),
-              ftds: parseInt(row.ftd || row.FTD || row.first_time_depositors || 0),
-              deposits: parseInt(row.deposits || row.Deposits || 0),
-              revenue: Math.round(parseFloat(row.commission || row.Commission || row.earnings || 0) * 100)
-            });
-          }
+        // Calculate last month
+        const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        const lastMonthStart = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, '0')}-01`;
+        const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0); // Last day of previous month
+        const lastMonthEndStr = `${lastMonthEnd.getFullYear()}-${String(lastMonthEnd.getMonth() + 1).padStart(2, '0')}-${String(lastMonthEnd.getDate()).padStart(2, '0')}`;
+
+        // Fetch both months in one request (from last month start to today)
+        const statsUrl = `https://${domain}/statistics.php?d1=${lastMonthStart}&d2=${currentMonthEnd}&mode=csv&sbm=1&dnl=1`;
+
+        this.log(`MyAffiliates - fetching stats (last month + current): ${statsUrl}`);
+
+        // Try GET first (some MyAffiliates implementations use GET)
+        let response;
+        try {
+          response = await this.httpRequest(statsUrl, {
+            method: 'GET',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Accept': 'text/csv, text/plain, */*'
+            }
+          });
+        } catch (getError) {
+          // If GET fails, try POST
+          this.log('GET failed, trying POST...', 'info');
+          response = await this.httpRequest(statsUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Accept': 'text/csv, text/plain, */*'
+            }
+          });
+        }
+
+        // Parse CSV response
+        const csvText = typeof response === 'string' ? response : (response.data || '');
+
+        if (!csvText || csvText.includes('<!DOCTYPE') || csvText.includes('<html')) {
+          throw new Error('Received HTML instead of CSV - token may be invalid');
+        }
+
+        this.log(`MyAffiliates - received ${csvText.length} bytes of CSV data`);
+
+        const stats = this.parseMyAffiliatesCsv(csvText);
+        this.log(`MyAffiliates - parsed ${stats.length} stat rows`);
+
+        // Debug: show parsed stats
+        if (stats.length > 0) {
+          this.log(`MyAffiliates - first parsed row: ${JSON.stringify(stats[0])}`);
         }
 
         return stats;
       } catch (error) {
-        this.log(`API failed: ${error.message}, will try scraping if credentials available`, 'warn');
+        this.log(`MyAffiliates API failed: ${error.message}`, 'warn');
+        // Log more details for debugging
+        if (error.message.includes('404')) {
+          this.log(`HTTP 404: OAuth endpoint not found at ${domain}. Check if the Base URL is correct - it should be the affiliate portal subdomain (e.g., affiliates.domain.com or secure.domain.com)`, 'warn');
+        }
+        if (error.message.includes('400')) {
+          this.log('HTTP 400 may indicate wrong URL format or missing parameters', 'warn');
+        }
+        if (error.message.includes('401') || error.message.includes('403')) {
+          this.log('Authentication failed - check Client ID and Client Secret', 'warn');
+        }
         // Fall through to scraping if API fails and we have credentials
-        if (!hasCredentials) {
+        if (!hasWebCredentials) {
+          this.log('No username/password configured for fallback scraping', 'info');
           throw error;
         }
+        this.log('Falling back to web scraping...');
       }
     }
 
     // Use web scraping with username/password
-    if (!hasCredentials) {
-      throw new Error('MyAffiliates requires either API key OR username/password');
+    if (!hasWebCredentials) {
+      throw new Error('MyAffiliates requires either OAuth2 credentials (Client ID + Secret) OR username/password');
     }
 
     if (!loginPath) {
@@ -839,7 +1307,7 @@ class SyncEngine {
     }
 
     this.log('MyAffiliates - using web scraping');
-    const scr = scraper || this.scraper; // Use dedicated scraper for parallel safety
+    const scr = scraper || this.scraper;
 
     try {
       const { startDate, endDate } = this.getDateRange(7);
@@ -852,7 +1320,6 @@ class SyncEngine {
         endDate
       });
 
-      // Only close pages if not in batch mode
       if (!this.inBatchMode) {
         await scr.closePages();
       }
@@ -946,42 +1413,665 @@ class SyncEngine {
     return stats;
   }
 
-  // NetRefer
-  async syncNetrefer({ program, credentials, config, apiUrl }) {
-    const baseUrl = apiUrl || config?.apiUrl;
+  // NetRefer - Web scraper for MonthlyFigures report
+  async syncNetrefer({ program, credentials, config, loginUrl, scraper }) {
+    const scr = scraper || this.scraper; // Use dedicated scraper for parallel safety
+    const baseUrl = loginUrl || config?.loginUrl;
     if (!baseUrl) {
-      throw new Error('No API URL configured');
+      throw new Error('No login URL configured');
     }
 
-    const apiKey = credentials.apiKey;
-    if (!apiKey) {
-      throw new Error('API key required for NetRefer');
+    const username = credentials.username;
+    const password = credentials.password;
+    if (!username || !password) {
+      throw new Error('Username and password required for NetRefer');
     }
 
-    const { startDate, endDate } = this.getDateRange(7);
+    this.log('NetRefer - logging in...');
 
-    const url = `${baseUrl}/api/stats?apiKey=${apiKey}&from=${startDate}&to=${endDate}`;
+    // Launch browser and create page (following the same pattern as other scrapers)
+    await scr.launch();
+    const page = await scr.browser.newPage();
 
-    const response = await this.httpRequest(url);
+    try {
+      // Set user agent
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
 
-    const stats = [];
-    const data = response.data?.stats || response.data;
+      // Navigate to login page
+      this.log(`NetRefer - navigating to ${baseUrl}`);
+      await page.goto(baseUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await scr.delay(2000);
 
-    if (Array.isArray(data)) {
-      for (const row of data) {
-        stats.push({
-          date: row.date,
-          clicks: parseInt(row.clicks || 0),
-          impressions: parseInt(row.views || row.impressions || 0),
-          signups: parseInt(row.signups || 0),
-          ftds: parseInt(row.ftds || 0),
-          deposits: parseInt(row.deposits || 0),
-          revenue: Math.round(parseFloat(row.commission || 0) * 100)
-        });
+      // Fill login form
+      const usernameSelectors = ['input[name="username"]', 'input[name="email"]', '#username', '#email', 'input[type="text"]'];
+      const passwordSelectors = ['input[name="password"]', '#password', 'input[type="password"]'];
+
+      for (const sel of usernameSelectors) {
+        try {
+          const exists = await page.$(sel);
+          if (exists) {
+            await page.type(sel, username);
+            this.log(`NetRefer - filled username using selector: ${sel}`);
+            break;
+          }
+        } catch (e) { /* try next */ }
       }
+
+      for (const sel of passwordSelectors) {
+        try {
+          const exists = await page.$(sel);
+          if (exists) {
+            await page.type(sel, password);
+            this.log(`NetRefer - filled password`);
+            break;
+          }
+        } catch (e) { /* try next */ }
+      }
+
+      // Submit login
+      try {
+        const submitBtn = await page.$('button[type="submit"], input[type="submit"], .login-button, #loginButton, .btn-primary');
+        if (submitBtn) {
+          await Promise.all([
+            submitBtn.click(),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
+          ]);
+        }
+      } catch (e) {
+        this.log(`NetRefer - login submit: ${e.message}`);
+      }
+
+      await scr.delay(3000);
+
+      // Navigate to Monthly Figures report
+      const reportsUrl = new URL('/Reports/MonthlyFigures', baseUrl).href;
+      this.log(`NetRefer - navigating to ${reportsUrl}`);
+      await page.goto(reportsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await scr.delay(2000);
+
+      // Calculate date values for this month and last month
+      // Format is YYMM (e.g., 2601 for Jan 2026, 2512 for Dec 2025)
+      const now = new Date();
+      const thisMonthValue = `${String(now.getFullYear()).slice(2)}${String(now.getMonth() + 1).padStart(2, '0')}`;
+      const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const lastMonthValue = `${String(lastMonthDate.getFullYear()).slice(2)}${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}`;
+
+      this.log(`NetRefer - fetching this month (${thisMonthValue}) and last month (${lastMonthValue})`);
+
+      const allStats = [];
+
+      // Fetch this month's data
+      const thisMonthStats = await this.fetchNetReferMonth(page, scr, thisMonthValue, thisMonthValue);
+      allStats.push(...thisMonthStats);
+
+      // Fetch last month's data
+      const lastMonthStats = await this.fetchNetReferMonth(page, scr, lastMonthValue, lastMonthValue);
+      allStats.push(...lastMonthStats);
+
+      this.log(`NetRefer - returning ${allStats.length} month(s) of data`);
+
+      return allStats;
+    } finally {
+      // Close the page
+      try {
+        await page.close();
+      } catch (e) { /* ignore */ }
     }
+  }
+
+  // Helper to fetch a specific month from NetRefer by selecting dates and clicking Search
+  async fetchNetReferMonth(page, scr, fromValue, toValue) {
+    this.log(`NetRefer - selecting date range: ${fromValue} to ${toValue}`);
+
+    // Select the From date
+    await page.select('#selectedDateFrom', fromValue);
+    await scr.delay(500);
+
+    // Select the To date
+    await page.select('#selectedDateTo', toValue);
+    await scr.delay(500);
+
+    // Click the Search button
+    this.log('NetRefer - clicking Search button...');
+    await page.click('#btnSearch');
+
+    // Wait for the table to load (it updates via AJAX)
+    await scr.delay(3000);
+
+    // Wait for table rows to appear
+    try {
+      await page.waitForSelector('#monthlyFiguresDataTable tbody tr', { timeout: 10000 });
+    } catch (e) {
+      this.log('NetRefer - no data rows found for this period');
+      return [];
+    }
+
+    // Parse the table
+    return await this.parseNetReferTable(page);
+  }
+
+  // Parse NetRefer MonthlyFigures table - scrapes all rows from #monthlyFiguresDataTable
+  async parseNetReferTable(page) {
+    this.log('NetRefer - parsing table data...');
+
+    const stats = await page.evaluate(() => {
+      const table = document.querySelector('#monthlyFiguresDataTable');
+      if (!table) return [];
+
+      const results = [];
+      const rows = table.querySelectorAll('tbody tr');
+
+      // Table columns by index:
+      // 0: Month (e.g., "2025-12")
+      // 1: Views
+      // 2: Unique Views
+      // 3: Clicks
+      // 4: Unique Clicks
+      // 5: Signups
+      // 6: Depositing Customers
+      // 7: Active Customers
+      // 8: New Depositing Customers
+      // 9: New Active Customers
+      // 10: First Time Depositing Customers (FTD)
+      // 11: First Time Active Customers
+      // 12: Deposits (€0.00)
+      // 13: Net Revenue (€-0.83)
+
+      rows.forEach(row => {
+        const cells = row.querySelectorAll('td');
+        if (cells.length < 14) return;
+
+        const monthStr = cells[0]?.textContent?.trim() || '';
+        if (!monthStr || !monthStr.match(/^\d{4}-\d{2}$/)) return;
+
+        const parseNum = (cell) => {
+          const text = cell?.textContent?.trim() || '0';
+          return parseInt(text.replace(/[^0-9-]/g, '')) || 0;
+        };
+
+        const parseCurrency = (cell) => {
+          const text = cell?.textContent?.trim() || '0';
+          const num = parseFloat(text.replace(/[^0-9.-]/g, '')) || 0;
+          return Math.round(num * 100); // Convert to cents
+        };
+
+        results.push({
+          date: `${monthStr}-01`, // Convert "2025-12" to "2025-12-01"
+          impressions: parseNum(cells[1]), // Views
+          clicks: parseNum(cells[3]), // Clicks
+          signups: parseNum(cells[5]), // Signups
+          ftds: parseNum(cells[10]), // First Time Depositing Customers
+          deposits: parseCurrency(cells[12]), // Deposits
+          revenue: parseCurrency(cells[13]) // Net Revenue
+        });
+      });
+
+      return results;
+    });
+
+    this.log(`NetRefer - found ${stats.length} months in table`);
+    stats.forEach(s => {
+      this.log(`  ${s.date}: clicks=${s.clicks}, signups=${s.signups}, ftds=${s.ftds}, revenue=${s.revenue/100}`);
+    });
 
     return stats;
+  }
+
+  // EGO Platform - Web scraper with jQuery UI datepickers
+  async syncEgo({ program, credentials, config, loginUrl, scraper }) {
+    const scr = scraper || this.scraper;
+    const baseUrl = loginUrl || config?.loginUrl;
+    if (!baseUrl) {
+      throw new Error('No login URL configured');
+    }
+
+    const username = credentials.username;
+    const password = credentials.password;
+    if (!username || !password) {
+      throw new Error('Username and password required for EGO');
+    }
+
+    this.log('EGO - logging in...');
+
+    // Launch browser and create page
+    await scr.launch();
+    const page = await scr.browser.newPage();
+
+    try {
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+      // Navigate to login page
+      this.log(`EGO - navigating to ${baseUrl}`);
+      await page.goto(baseUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await scr.delay(2000);
+
+      // Fill login form
+      const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[name="login"]', '#username', '#email', 'input[type="text"]'];
+      const passwordSelectors = ['input[name="password"]', '#password', 'input[type="password"]'];
+
+      for (const sel of usernameSelectors) {
+        try {
+          const exists = await page.$(sel);
+          if (exists) {
+            await page.type(sel, username);
+            this.log(`EGO - filled username`);
+            break;
+          }
+        } catch (e) { /* try next */ }
+      }
+
+      for (const sel of passwordSelectors) {
+        try {
+          const exists = await page.$(sel);
+          if (exists) {
+            await page.type(sel, password);
+            this.log(`EGO - filled password`);
+            break;
+          }
+        } catch (e) { /* try next */ }
+      }
+
+      // Submit login
+      const submitBtn = await page.$('button[type="submit"], input[type="submit"], .bouton, .btn-primary');
+      if (submitBtn) {
+        await Promise.all([
+          submitBtn.click(),
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
+        ]);
+      }
+
+      await scr.delay(3000);
+
+      // Navigate to stats page if not already there
+      // EGO stats pages are typically at /affiliates/statistics.html or similar
+      const currentUrl = page.url();
+      if (!currentUrl.includes('statistic')) {
+        const statsUrl = new URL('/affiliates/statistics.html', baseUrl).href;
+        this.log(`EGO - navigating to stats: ${statsUrl}`);
+        await page.goto(statsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await scr.delay(2000);
+      }
+
+      // Set date range to current month
+      // EGO uses hidden inputs: #jDate1D (datedeb) and #jDate2D (datefin) in DD-MM-YYYY format
+      const now = new Date();
+      const firstOfMonth = `1-${now.getMonth() + 1}-${now.getFullYear()}`;
+      const today = `${now.getDate()}-${now.getMonth() + 1}-${now.getFullYear()}`;
+
+      this.log(`EGO - setting date range: ${firstOfMonth} to ${today}`);
+
+      // Set the hidden input values directly via JavaScript
+      await page.evaluate((fromDate, toDate) => {
+        const fromInput = document.querySelector('#jDate1D');
+        const toInput = document.querySelector('#jDate2D');
+        if (fromInput) fromInput.value = fromDate;
+        if (toInput) toInput.value = toDate;
+      }, firstOfMonth, today);
+
+      await scr.delay(500);
+
+      // Submit the form
+      this.log('EGO - submitting form...');
+      const formSubmit = await page.$('input[type="submit"].bouton, input[type="submit"]');
+      if (formSubmit) {
+        await Promise.all([
+          formSubmit.click(),
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
+        ]);
+      }
+
+      await scr.delay(3000);
+
+      // Parse the stats table - look for TOTAL row
+      const stats = await this.parseEgoTable(page);
+
+      // Also fetch last month
+      const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0); // Last day of previous month
+      const lastMonthFrom = `1-${lastMonthDate.getMonth() + 1}-${lastMonthDate.getFullYear()}`;
+      const lastMonthTo = `${lastMonthEnd.getDate()}-${lastMonthEnd.getMonth() + 1}-${lastMonthEnd.getFullYear()}`;
+
+      this.log(`EGO - fetching last month: ${lastMonthFrom} to ${lastMonthTo}`);
+
+      await page.evaluate((fromDate, toDate) => {
+        const fromInput = document.querySelector('#jDate1D');
+        const toInput = document.querySelector('#jDate2D');
+        if (fromInput) fromInput.value = fromDate;
+        if (toInput) toInput.value = toDate;
+      }, lastMonthFrom, lastMonthTo);
+
+      await scr.delay(500);
+
+      const formSubmit2 = await page.$('input[type="submit"].bouton, input[type="submit"]');
+      if (formSubmit2) {
+        await Promise.all([
+          formSubmit2.click(),
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
+        ]);
+      }
+
+      await scr.delay(3000);
+
+      const lastMonthStats = await this.parseEgoTable(page, lastMonthDate);
+      stats.push(...lastMonthStats);
+
+      this.log(`EGO - returning ${stats.length} month(s) of data`);
+      return stats;
+    } finally {
+      try {
+        await page.close();
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  // Parse EGO stats table - get TOTAL row
+  async parseEgoTable(page, dateOverride = null) {
+    this.log('EGO - parsing stats table...');
+
+    const stats = await page.evaluate(() => {
+      // Find the data table
+      const table = document.querySelector('table.dataTable');
+      if (!table) return null;
+
+      // Find the TOTAL row (last row in tbody, or row containing "TOTAL")
+      const rows = table.querySelectorAll('tbody tr');
+      let totalRow = null;
+
+      for (const row of rows) {
+        const firstCell = row.querySelector('td');
+        if (firstCell && firstCell.textContent.includes('TOTAL')) {
+          totalRow = row;
+          break;
+        }
+      }
+
+      if (!totalRow) {
+        // Use last row as fallback
+        totalRow = rows[rows.length - 1];
+      }
+
+      if (!totalRow) return null;
+
+      const cells = totalRow.querySelectorAll('td');
+      if (cells.length < 12) return null;
+
+      // Parse currency values (European format with comma: "0,00 $")
+      const parseCurrency = (text) => {
+        if (!text) return 0;
+        // Remove currency symbol, spaces, and convert comma to dot
+        const cleaned = text.replace(/[^0-9,.-]/g, '').replace(',', '.');
+        return Math.round(parseFloat(cleaned) * 100) || 0;
+      };
+
+      // Column mapping from the HTML:
+      // 0: Website (TOTAL)
+      // 1: Disp. (impressions)
+      // 2: Clic (clicks)
+      // 3: Sign. (signups)
+      // 4: CPA BL
+      // 5: First Qty Deposit (FTDs)
+      // 6: First Deposit
+      // 7: Revenue CPA
+      // 8: NGR
+      // 9: Total Deposit
+      // 10: Net Income
+      // 11: Earnings
+
+      return {
+        impressions: parseInt(cells[1]?.textContent?.trim() || '0') || 0,
+        clicks: parseInt(cells[2]?.textContent?.trim() || '0') || 0,
+        signups: parseInt(cells[3]?.textContent?.trim() || '0') || 0,
+        ftds: parseInt(cells[5]?.textContent?.trim() || '0') || 0,
+        deposits: parseCurrency(cells[9]?.textContent), // Total Deposit
+        revenue: parseCurrency(cells[11]?.textContent) // Earnings
+      };
+    });
+
+    if (!stats) {
+      this.log('EGO - no stats table found');
+      return [];
+    }
+
+    // Determine the date for this record
+    const date = dateOverride || new Date();
+    const dateStr = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-01`;
+
+    this.log(`EGO - ${dateStr}: clicks=${stats.clicks}, signups=${stats.signups}, ftds=${stats.ftds}, revenue=${stats.revenue/100}`);
+
+    return [{
+      date: dateStr,
+      clicks: stats.clicks,
+      impressions: stats.impressions,
+      signups: stats.signups,
+      ftds: stats.ftds,
+      deposits: stats.deposits,
+      withdrawals: 0,
+      chargebacks: 0,
+      revenue: stats.revenue
+    }];
+  }
+
+  // Mexos Platform - Angular SPA with hash routing
+  async syncMexos({ program, credentials, config, loginUrl, scraper }) {
+    const scr = scraper || this.scraper;
+    const baseUrl = loginUrl || config?.loginUrl;
+    if (!baseUrl) {
+      throw new Error('No login URL configured');
+    }
+
+    const username = credentials.username;
+    const password = credentials.password;
+    if (!username || !password) {
+      throw new Error('Username and password required for Mexos');
+    }
+
+    this.log('Mexos - logging in...');
+
+    // Launch browser and create page
+    await scr.launch();
+    const page = await scr.browser.newPage();
+
+    try {
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+
+      // Navigate to login page
+      this.log(`Mexos - navigating to ${baseUrl}`);
+      await page.goto(baseUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await scr.delay(3000);
+
+      // Fill login form
+      const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[name="login"]', '#username', '#email', 'input[type="text"]', 'input[type="email"]'];
+      const passwordSelectors = ['input[name="password"]', '#password', 'input[type="password"]'];
+
+      for (const sel of usernameSelectors) {
+        try {
+          const exists = await page.$(sel);
+          if (exists) {
+            await page.type(sel, username);
+            this.log(`Mexos - filled username`);
+            break;
+          }
+        } catch (e) { /* try next */ }
+      }
+
+      for (const sel of passwordSelectors) {
+        try {
+          const exists = await page.$(sel);
+          if (exists) {
+            await page.type(sel, password);
+            this.log(`Mexos - filled password`);
+            break;
+          }
+        } catch (e) { /* try next */ }
+      }
+
+      // Submit login
+      const submitBtn = await page.$('button[type="submit"], input[type="submit"], .btn-primary, .login-btn');
+      if (submitBtn) {
+        await Promise.all([
+          submitBtn.click(),
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
+        ]);
+      }
+
+      await scr.delay(4000);
+
+      // Navigate to statistics page (Angular hash routing)
+      const statsUrl = baseUrl.replace(/\/$/, '') + '/#/statistics';
+      this.log(`Mexos - navigating to statistics: ${statsUrl}`);
+      await page.goto(statsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await scr.delay(4000);
+
+      // Wait for Angular to load the form
+      try {
+        await page.waitForSelector('.statistics-box', { timeout: 10000 });
+      } catch (e) {
+        this.log('Mexos - statistics form not found, trying to continue');
+      }
+
+      // Fetch current month stats
+      const now = new Date();
+      const allStats = [];
+
+      // Current month
+      const thisMonthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+      const thisMonthEnd = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+      const thisMonthStats = await this.fetchMexosStats(page, scr, thisMonthStart, thisMonthEnd);
+      if (thisMonthStats) {
+        thisMonthStats.date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+        allStats.push(thisMonthStats);
+      }
+
+      // Last month
+      const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+      const lastMonthStart = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}-01`;
+      const lastMonthEndStr = `${lastMonthEnd.getFullYear()}-${String(lastMonthEnd.getMonth() + 1).padStart(2, '0')}-${String(lastMonthEnd.getDate()).padStart(2, '0')}`;
+      const lastMonthStats = await this.fetchMexosStats(page, scr, lastMonthStart, lastMonthEndStr);
+      if (lastMonthStats) {
+        lastMonthStats.date = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}-01`;
+        allStats.push(lastMonthStats);
+      }
+
+      this.log(`Mexos - returning ${allStats.length} month(s) of data`);
+      return allStats;
+    } finally {
+      try {
+        await page.close();
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  // Helper to fetch Mexos stats for a date range
+  async fetchMexosStats(page, scr, startDate, endDate) {
+    const dateRange = `${startDate} - ${endDate}`;
+    this.log(`Mexos - setting date range: ${dateRange}`);
+
+    // Set the date range value via JavaScript (Angular input)
+    await page.evaluate((range) => {
+      const input = document.querySelector('#statDate, input[name="dateRange"], .date-range');
+      if (input) {
+        input.value = range;
+        // Trigger Angular change detection
+        const event = new Event('input', { bubbles: true });
+        input.dispatchEvent(event);
+        const changeEvent = new Event('change', { bubbles: true });
+        input.dispatchEvent(changeEvent);
+      }
+    }, dateRange);
+
+    await scr.delay(1000);
+
+    // Click Run Report button
+    this.log('Mexos - clicking Run Report...');
+    const runBtn = await page.$('button.btn:not(.btn-export)');
+    if (runBtn) {
+      await runBtn.click();
+    } else {
+      // Try finding by text content
+      await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button.btn'));
+        const runBtn = buttons.find(b => b.textContent.includes('Run Report'));
+        if (runBtn) runBtn.click();
+      });
+    }
+
+    await scr.delay(5000);
+
+    // Wait for table to load
+    try {
+      await page.waitForSelector('table.statistic-table tfoot .grand-total', { timeout: 15000 });
+    } catch (e) {
+      this.log('Mexos - no results table found');
+      return null;
+    }
+
+    // Parse the Grand Totals row
+    const stats = await page.evaluate(() => {
+      const totalRow = document.querySelector('table.statistic-table tfoot tr.grand-total');
+      if (!totalRow) return null;
+
+      const cells = totalRow.querySelectorAll('td');
+      if (cells.length < 14) return null;
+
+      // Parse number, handling decimals
+      const parseNum = (text) => {
+        if (!text) return 0;
+        const cleaned = text.replace(/[^0-9.-]/g, '');
+        return parseFloat(cleaned) || 0;
+      };
+
+      // Column mapping based on headers:
+      // 0: (empty - Date total)
+      // 1: Impressions
+      // 2: Unique Clicks
+      // 3: Casino Signups Cnt
+      // 4: Sport Signups Cnt
+      // 5: Casino RFD Amt
+      // 6: Casino RFD Cnt (FTDs casino)
+      // 7: Sport RFD Amt
+      // 8: Sport RFD Cnt (FTDs sport)
+      // 9: Signup To RFD Ratio
+      // 10: Deposit Cnt
+      // 11: Withdrawal Cnt
+      // 12: Withdrawal Amt
+      // 13: Commission
+      // 14: Casino Net Gaming Commission
+      // 15: Sport Net Gaming Commission
+      // 16: Net Gaming After Deduction
+
+      const casinoFtds = parseInt(cells[6]?.textContent?.trim() || '0') || 0;
+      const sportFtds = parseInt(cells[8]?.textContent?.trim() || '0') || 0;
+
+      return {
+        impressions: parseInt(cells[1]?.textContent?.trim() || '0') || 0,
+        clicks: parseInt(cells[2]?.textContent?.trim() || '0') || 0,
+        signups: (parseInt(cells[3]?.textContent?.trim() || '0') || 0) + (parseInt(cells[4]?.textContent?.trim() || '0') || 0),
+        ftds: casinoFtds + sportFtds,
+        deposits: Math.round(parseNum(cells[5]?.textContent) * 100) + Math.round(parseNum(cells[7]?.textContent) * 100), // RFD Amt
+        withdrawals: Math.round(parseNum(cells[12]?.textContent) * 100),
+        revenue: Math.round(parseNum(cells[13]?.textContent) * 100) // Commission
+      };
+    });
+
+    if (!stats) {
+      this.log('Mexos - failed to parse grand totals');
+      return null;
+    }
+
+    this.log(`Mexos - ${startDate}: clicks=${stats.clicks}, signups=${stats.signups}, ftds=${stats.ftds}, revenue=${stats.revenue/100}`);
+
+    return {
+      date: startDate,
+      clicks: stats.clicks,
+      impressions: stats.impressions,
+      signups: stats.signups,
+      ftds: stats.ftds,
+      deposits: stats.deposits,
+      withdrawals: stats.withdrawals,
+      chargebacks: 0,
+      revenue: stats.revenue
+    };
   }
 
   // Wynta - auto-detect API vs Web Login
@@ -1069,29 +2159,41 @@ class SyncEngine {
     }
   }
 
-  // 7BitPartners API
-  // Docs: https://dashboard.7bitpartners.com/partner/api_docs/customer/partner/traffic_reports/
+  // Affilka Platform API
   // Generic Affilka platform sync (works for any Affilka-based affiliate program)
+  // Affilka-based platforms (7BitPartners, GoPartners, 50Partners, etc.)
+  // API docs: {baseUrl}/partner/api_docs/customer/partner/traffic_reports/
   async syncAffilka({ program, credentials, config, apiUrl }) {
-    // Affilka is a white-label platform used by many affiliate programs
-    // Examples: 7BitPartners, GoPartners, etc.
-    // Users need to provide their dashboard URL (base domain only)
     let baseUrl = apiUrl || config?.apiUrl;
 
     if (!baseUrl) {
-      throw new Error('Affilka programs require a Base URL (e.g., https://affiliates.yourprogram.com)');
+      throw new Error('Affilka programs require a Base URL (e.g., https://dashboard.yourprogram.com)');
     }
 
-    // Clean up the base URL - remove any API path if included
-    // User might enter: https://affiliates.casinoadrenaline.com/api/customer/v1/partner
-    // We need: https://affiliates.casinoadrenaline.com
-    baseUrl = baseUrl.replace(/\/api\/customer.*$/, '').replace(/\/partner.*$/, '');
+    // Check if user specified a custom API path (e.g., /partner/api)
+    // If the URL contains /partner/api or similar, preserve it as custom API base
+    const hasCustomApiPath = /\/partner\/api|\/api\/v\d/.test(baseUrl);
 
-    return this.sync7BitPartners({ program, credentials, config, apiUrl: baseUrl });
+    if (hasCustomApiPath) {
+      // User specified a custom API path - pass it through as-is
+      this.log(`Affilka - using custom API path: ${baseUrl}`);
+      baseUrl = baseUrl.replace(/\/+$/, ''); // Just remove trailing slashes
+    } else {
+      // Clean up the base URL - only strip if it's the standard path
+      baseUrl = baseUrl
+        .replace(/\/api\/customer.*$/, '')  // Remove standard API path if included
+        .replace(/\/+$/, '');                // Remove trailing slashes
+    }
+
+    return this.syncAffilkaAPI({ program, credentials, config, apiUrl: baseUrl, customApiPath: hasCustomApiPath });
   }
 
-  async sync7BitPartners({ program, credentials, config, apiUrl }) {
-    const baseUrl = apiUrl || config?.apiUrl || 'https://dashboard.7bitpartners.com';
+  async syncAffilkaAPI({ program, credentials, config, apiUrl, customApiPath }) {
+    let baseUrl = apiUrl || config?.apiUrl || 'https://dashboard.7bitpartners.com';
+
+    // Clean up the base URL - remove trailing slashes
+    baseUrl = baseUrl.replace(/\/+$/, '');
+
     const token = credentials.apiKey || ''; // This is the "statistic token" from Affilka
     const username = credentials.username || '';
     const password = credentials.password || '';
@@ -1101,315 +2203,304 @@ class SyncEngine {
     const hasCredentials = username.length > 0 && password.length > 0;
 
     if (!hasToken && !hasCredentials) {
-      throw new Error('API token (statistic token) OR username/password required for 7BitPartners/Affilka');
+      throw new Error('API token (statistic token) OR username/password required for Affilka');
     }
 
-    // Get CURRENT MONTH range (not last 30 days)
-    // The dashboard shows "Month" = current month data
+    // Get date ranges for current month and last month
     const now = new Date();
-    const firstDayOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-    const startDateISO = this.formatDate(firstDayOfMonth);
-    const endDateISO = this.formatDate(now);
 
-    this.log(`Fetching 7BitPartners/Affilka stats from ${startDateISO} to ${endDateISO} (current month)`);
+    // Current month
+    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const currentMonthEnd = now;
+
+    // Last month
+    const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0); // Last day of previous month
+
+    this.log(`Fetching Affilka stats for current month and last month`);
 
     // If no token but have credentials, fall back to web scraping
     if (!hasToken && hasCredentials) {
-      this.log('No API token - falling back to web login');
-      return this.sync7BitPartnersScrape({ program, credentials, config, loginUrl: `${baseUrl}/partner/login` });
+      this.log(`No API token - falling back to web login for ${baseUrl}`);
+      this.log(`Using credentials: username=${username ? 'SET' : 'EMPTY'}, password=${password ? 'SET' : 'EMPTY'}`);
+      const loginUrl = `${baseUrl}/partner/login`;
+      this.log(`Login URL: ${loginUrl}`);
+      return this.syncAffilkaScrape({ program, credentials, config, loginUrl });
     }
 
-    // Affilka API structure (from docs: https://wiki.affilka.net/en/home/affiliate-interface-manual)
-    // API endpoint: /api/customer/v1/partner/report
+    // Affilka API
     // Authorization: statistic token in header
-    const endpoints = [];
 
-    if (hasToken) {
-      // First, get available report attributes to see what fields are available
-      let availableAttributes = [];
-      try {
-        this.log('Fetching available report attributes...');
-        const attrsResponse = await this.httpRequest(`${baseUrl}/partner/api_docs/customer/partner/reports/available_report_attributes`, {
-          headers: { 'Authorization': token, 'Accept': 'application/json' }
-        });
-        this.log(`Attributes response: ${JSON.stringify(attrsResponse.data)}`);
-      } catch (error) {
-        this.log(`Could not fetch attributes: ${error.message}`, 'warn');
-      }
-
-      // Affilka API endpoints with correct parameter format
-      // Ref: https://dashboard.7bitpartners.com/partner/api_docs/customer/partner/reports/report_with_ngr_column_and_grouping.md
-
-      const today = new Date().toISOString().split('T')[0];
-
-      endpoints.push(
-        // 1. Partner report with CORRECT columns (partner_income = commission!)
-        {
-          url: `${baseUrl}/api/customer/v1/partner/report`,
-          params: {
-            async: 'false',
-            from: startDateISO,
-            to: endDateISO,
-            exchange_rates_date: today,
-            'columns[]': [
-              'visits_count',           // Clicks
-              'registrations_count',    // Signups
-              'first_deposits_count',   // FTDs
-              'deposits_sum',           // Total deposits amount
-              'ngr',                    // Net Gaming Revenue
-              'partner_income'          // AFFILIATE COMMISSION (this is what we need!)
-            ],
-            'group_by[]': ['month']     // Group by month as suggested
-          },
-          authHeader: token,
-          format: 'partner-report-with-income'
-        },
-        // 2. Try with date grouping for daily breakdown
-        {
-          url: `${baseUrl}/api/customer/v1/partner/report`,
-          params: {
-            async: 'false',
-            from: startDateISO,
-            to: endDateISO,
-            exchange_rates_date: today,
-            'columns[]': [
-              'visits_count',
-              'registrations_count',
-              'first_deposits_count',
-              'deposits_sum',
-              'ngr',
-              'partner_income'
-            ],
-            'group_by[]': ['date']
-          },
-          authHeader: token,
-          format: 'partner-report-by-date'
-        },
-        // 3. Traffic report (fallback)
-        {
-          url: `${baseUrl}/api/customer/v1/partner/traffic_report`,
-          params: {
-            from: startDateISO,
-            to: endDateISO
-          },
-          authHeader: token,
-          format: 'traffic-report'
-        }
-      );
+    if (!hasToken) {
+      throw new Error('Affilka programs require an API Token');
     }
 
-    let lastError;
+    // Helper function to fetch stats for a date range
+    const fetchAffilkaStats = async (startDate, endDate, label) => {
+      const startDateISO = this.formatDate(startDate);
+      const endDateISO = this.formatDate(endDate);
 
-    for (const endpoint of endpoints) {
-      try {
-        // Build URL with query params (handle arrays for Affilka API)
-        let queryString = '';
-        const params = endpoint.params || {};
+      // Use /report endpoint with array syntax for columns[] and group_by[]
+      const columns = [
+        'visits_count',
+        'registrations_count',
+        'first_deposits_count',
+        'deposits_sum',
+        'partner_income'
+      ];
 
-        for (const [key, value] of Object.entries(params)) {
-          if (Array.isArray(value)) {
-            // Handle array parameters like columns[] and group_by[]
-            value.forEach(item => {
-              queryString += `${queryString ? '&' : ''}${encodeURIComponent(key)}=${encodeURIComponent(item)}`;
-            });
-          } else {
-            queryString += `${queryString ? '&' : ''}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
-          }
-        }
+      const columnsParam = columns.map(c => `columns[]=${c}`).join('&');
 
-        const fullUrl = `${endpoint.url}?${queryString}`;
+      let url;
+      if (customApiPath) {
+        url = `${baseUrl}/report?async=false&from=${startDateISO}&to=${endDateISO}&${columnsParam}&group_by[]=month&conversion_currency=USD`;
+      } else {
+        url = `${baseUrl}/api/customer/v1/partner/report?async=false&from=${startDateISO}&to=${endDateISO}&${columnsParam}&group_by[]=month&conversion_currency=USD`;
+      }
 
-        const displayUrl = token ? fullUrl.replace(token, 'TOKEN_HIDDEN') : fullUrl;
-        this.log(`Trying endpoint (${endpoint.format || 'unknown format'}): ${displayUrl}${endpoint.auth === 'basic' ? ' (Basic Auth)' : ''}`);
+      this.log(`Fetching ${label}: ${startDateISO} to ${endDateISO}`);
 
-        const headers = {
+      const response = await this.httpRequest(url, {
+        headers: {
           'Accept': 'application/json',
-          'Content-Type': 'application/json'
-        };
-
-        if (endpoint.auth === 'basic' && basicAuth) {
-          headers['Authorization'] = `Basic ${basicAuth}`;
+          'Content-Type': 'application/json',
+          'Authorization': token
         }
+      });
 
-        if (endpoint.authHeader) {
-          headers['Authorization'] = endpoint.authHeader;
-        }
-
-        if (endpoint.customHeader) {
-          Object.assign(headers, endpoint.customHeader);
-        }
-
-        const response = await this.httpRequest(fullUrl, { headers });
-
-        // Show raw API response for debugging
-        this.log(`RAW API RESPONSE: ${JSON.stringify(response, null, 2)}`);
-
-        // Affilka API response structure: { rows: { data: [...] }, totals: { data: [...] } }
-        const rows = response.data?.rows?.data || [];
-        const totals = response.data?.totals?.data || [];
-
-        this.log(`Affilka API returned ${rows.length} row(s), ${totals.length} total(s)`);
-
-        // If we got empty data, try next endpoint (different parameters might work)
-        if (rows.length === 0 && totals.length === 0) {
-          this.log('⚠ No data with this endpoint/parameters, trying next...');
-          await this.delay(1000); // Small delay between attempts
-          continue; // Try next endpoint
-        }
-
-        const stats = [];
-        const statsByDate = new Map(); // Aggregate multiple currency rows by date
-
-        // Helper to parse Affilka money objects: { currency: "EUR", amount_cents: "41711.0" }
-        const parseMoneyValue = (value) => {
-          if (!value) return 0;
-          if (typeof value === 'number') return Math.round(value * 100);
-          if (typeof value === 'object' && value.amount_cents) {
-            return Math.round(parseFloat(value.amount_cents));
-          }
-          return Math.round(parseFloat(value) * 100);
-        };
-
-        // Use rows data (daily breakdown) if available
-        const dataToUse = rows.length > 0 ? rows : totals;
-
-        for (const row of dataToUse) {
-          // Check if this is the traffic_report format (array of name/value objects)
-          if (Array.isArray(row)) {
-            this.log(`Parsing traffic_report format (array of ${row.length} name/value pairs)`);
-
-            // Convert array of { name, value, type } to a simple object
-            const rowObj = {};
-            for (const field of row) {
-              if (field.name && field.value !== undefined) {
-                rowObj[field.name] = field.value;
-              }
-            }
-
-            this.log(`Converted to object: ${JSON.stringify(rowObj)}`);
-
-            // Aggregate by date (Affilka returns one row per currency)
-            const date = (rowObj.date || rowObj.month || startDateISO).split('T')[0]; // Just the date part
-            const existing = statsByDate.get(date) || {
-              date: date,
-              clicks: 0,
-              impressions: 0,
-              signups: 0,
-              ftds: 0,
-              deposits: 0,
-              revenue: 0
-            };
-
-            existing.clicks += parseInt(rowObj.visits_count || rowObj.visits || rowObj.clicks || rowObj.hits || 0);
-            existing.impressions += parseInt(rowObj.impressions || rowObj.views || 0);
-            existing.signups += parseInt(rowObj.registrations_count || rowObj.registrations || rowObj.signups || 0);
-            existing.ftds += parseInt(rowObj.first_deposits_count || rowObj.first_depositors_count || rowObj.depositors_count || rowObj.ftd_count || rowObj.first_deposits || rowObj.ftd || rowObj.depositors || 0);
-            existing.deposits += parseMoneyValue(rowObj.deposits_sum || rowObj.deposits || rowObj.deposit_amount);
-            existing.revenue += parseMoneyValue(rowObj.partner_income || rowObj.commission || rowObj.revenue);
-
-            statsByDate.set(date, existing);
-          } else {
-            // Standard object format
-            if (stats.length === 0) {
-              this.log(`Parsing standard format, keys: ${Object.keys(row).join(', ')}`);
-              // Log all values for debugging FTD issue
-              for (const [key, val] of Object.entries(row)) {
-                if (key.toLowerCase().includes('deposit') || key.toLowerCase().includes('ftd')) {
-                  this.log(`  -> ${key}: ${JSON.stringify(val)}`);
-                }
-              }
-            }
-
-            // Aggregate by date (handle multiple currency rows)
-            const date = (row.date || row.month || row.report_date || row.day || startDateISO).split('T')[0];
-            const existing = statsByDate.get(date) || {
-              date: date,
-              clicks: 0,
-              impressions: 0,
-              signups: 0,
-              ftds: 0,
-              deposits: 0,
-              revenue: 0
-            };
-
-            existing.clicks += parseInt(row.visits_count || row.clicks || row.hits || row.unique_clicks || 0);
-            existing.impressions += parseInt(row.impressions || row.views || row.banner_views || 0);
-            existing.signups += parseInt(row.registrations_count || row.registrations || row.signups || row.sign_ups || row.players || 0);
-            existing.ftds += parseInt(row.first_deposits_count || row.first_depositors_count || row.depositors_count || row.first_deposits || row.ftd || row.ftds || row.first_time_depositors || row.new_depositors || row.depositors || 0);
-            existing.deposits += Math.round(parseFloat(row.deposits_sum || row.deposits || row.deposit_amount || row.total_deposits || 0) * 100);
-            existing.revenue += Math.round(parseFloat(row.partner_income || row.commission || row.revenue || row.earnings || row.profit || row.total_commission || 0) * 100);
-
-            statsByDate.set(date, existing);
-          }
-        }
-
-        // Convert aggregated stats map to array
-        for (const stat of statsByDate.values()) {
-          stats.push(stat);
-        }
-
-        if (stats.length > 0) {
-          this.log(`✓ Parsed ${stats.length} stats records`);
-          return stats;
-        } else {
-          this.log('No stats after parsing');
-          // Return at least one empty record so sync doesn't completely fail
-          return [{
-            date: new Date().toISOString().split('T')[0],
-            clicks: 0,
-            impressions: 0,
-            signups: 0,
-            ftds: 0,
-            deposits: 0,
-            revenue: 0
-          }];
-        }
-      } catch (error) {
-        lastError = error;
-
-        // Check if it's a rate limit error
-        if (error.message.includes('429')) {
-          this.log('⚠ API rate limit reached - wait before syncing again', 'warn');
-          // Don't try more endpoints if rate limited
-          break;
-        }
-
-        this.log(`Endpoint failed: ${error.message}`, 'warn');
-        // Add delay to avoid rate limiting on next attempt
-        await this.delay(3000);
+      // Check for error responses
+      if (response.status === 403) {
+        throw new Error(`403 Forbidden - check your API token`);
       }
+      if (response.status === 401) {
+        throw new Error('401 Unauthorized - invalid token');
+      }
+      if (response.status === 404) {
+        throw new Error('API endpoint not found');
+      }
+      if (response.status !== 200) {
+        throw new Error(`API returned status ${response.status}`);
+      }
+
+      // Helper to extract numeric value from field
+      const getFieldValue = (field) => {
+        if (!field || field.value === undefined) return 0;
+        if (typeof field.value === 'object' && field.value.amount_cents !== undefined) {
+          return parseFloat(field.value.amount_cents) || 0;
+        }
+        return parseFloat(field.value) || 0;
+      };
+
+      // Parse totals
+      let totals = {};
+      const totalsData = response.data?.totals?.data || [];
+
+      if (totalsData.length > 0) {
+        for (const group of totalsData) {
+          if (!Array.isArray(group)) continue;
+          for (const field of group) {
+            if (!field.name) continue;
+            totals[field.name] = (totals[field.name] || 0) + getFieldValue(field);
+          }
+        }
+      } else {
+        // Sum up rows.data if no totals
+        const rowsData = response.data?.rows?.data || [];
+        for (const row of rowsData) {
+          if (!Array.isArray(row)) continue;
+          for (const field of row) {
+            if (!field.name) continue;
+            totals[field.name] = (totals[field.name] || 0) + getFieldValue(field);
+          }
+        }
+      }
+
+      // Use first day of the month as the date for this stat entry
+      const statDate = this.formatDate(startDate);
+
+      return {
+        date: statDate,
+        clicks: Math.round(totals.visits_count || 0),
+        impressions: 0,
+        signups: Math.round(totals.registrations_count || 0),
+        ftds: Math.round(totals.first_deposits_count || 0),
+        deposits: Math.round(totals.deposits_sum || 0),
+        revenue: Math.round(totals.partner_income || 0)
+      };
+    };
+
+    // Fetch current month and last month
+    const stats = [];
+
+    try {
+      const currentMonthStats = await fetchAffilkaStats(currentMonthStart, currentMonthEnd, 'current month');
+      this.log(`Current month: clicks=${currentMonthStats.clicks}, signups=${currentMonthStats.signups}, ftds=${currentMonthStats.ftds}, deposits=$${currentMonthStats.deposits/100}, revenue=$${currentMonthStats.revenue/100}`);
+      stats.push(currentMonthStats);
+    } catch (e) {
+      this.log(`Failed to fetch current month: ${e.message}`);
+      if (hasCredentials) {
+        this.log('Falling back to web scraping...');
+        return this.syncAffilkaScrape({ program, credentials, config, loginUrl: `${baseUrl}/partner/login` });
+      }
+      throw e;
     }
 
-    // If all failed, return empty record rather than throwing
-    this.log('All endpoints returned no data - check API token or account activity', 'warn');
-    return [{
-      date: new Date().toISOString().split('T')[0],
-      clicks: 0,
-      impressions: 0,
-      signups: 0,
-      ftds: 0,
-      deposits: 0,
-      revenue: 0
-    }];
+    try {
+      const lastMonthStats = await fetchAffilkaStats(lastMonthStart, lastMonthEnd, 'last month');
+      this.log(`Last month: clicks=${lastMonthStats.clicks}, signups=${lastMonthStats.signups}, ftds=${lastMonthStats.ftds}, deposits=$${lastMonthStats.deposits/100}, revenue=$${lastMonthStats.revenue/100}`);
+      stats.push(lastMonthStats);
+    } catch (e) {
+      this.log(`Failed to fetch last month: ${e.message}`);
+      // Continue with just current month if last month fails
+    }
+
+    this.log(`✓ Affilka sync complete: ${stats.length} month(s) fetched`);
+    return stats;
   }
 
-  // 7BitPartners Scrape - web login
-  async sync7BitPartnersScrape({ program, credentials, config, loginUrl, scraper }) {
+  // Alanbase API sync
+  async syncAlanbase({ program, credentials, config, apiUrl }) {
+    const baseUrl = apiUrl || config?.apiUrl;
+    const apiKey = credentials.apiKey;
+
+    if (!baseUrl) {
+      throw new Error('Alanbase requires an API URL (e.g., https://api.alanbase.com/v1)');
+    }
+
+    if (!apiKey) {
+      throw new Error('Alanbase requires an API Key');
+    }
+
+    // Clean up base URL
+    const cleanBaseUrl = baseUrl.replace(/\/+$/, '').replace(/\/v1\/?$/, '');
+
+    // Get date ranges for current month and last month
+    const now = new Date();
+
+    // Current month
+    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const currentMonthEnd = now;
+
+    // Last month
+    const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+
+    // Helper function to fetch stats for a date range
+    const fetchAlanbaseStats = async (startDate, endDate, label) => {
+      // Format dates as YYYY-MM-DD HH:mm
+      const formatDateTime = (d) => {
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day} 00:00`;
+      };
+
+      const formatDateTimeEnd = (d) => {
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${year}-${month}-${day} 23:59`;
+      };
+
+      const dateFrom = formatDateTime(startDate);
+      const dateTo = formatDateTimeEnd(endDate);
+
+      // Build API URL for common stats
+      const url = `${cleanBaseUrl}/v1/partner/statistic/common?group_by=day&timezone=UTC&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}&currency_code=USD`;
+
+      this.log(`Fetching Alanbase ${label}: ${dateFrom} to ${dateTo}`);
+
+      const response = await this.httpRequest(url, {
+        headers: {
+          'API-KEY': apiKey,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        }
+      });
+
+      if (response.status === 401) {
+        throw new Error('Invalid API key');
+      }
+
+      if (response.status !== 200) {
+        throw new Error(`API returned status ${response.status}`);
+      }
+
+      // Parse response - aggregate all days into monthly totals
+      const data = response.data?.data || [];
+
+      let totals = {
+        clicks: 0,
+        registrations: 0,
+        ftds: 0,
+        deposits: 0,
+        revenue: 0
+      };
+
+      for (const row of data) {
+        // Alanbase fields: clicks, registrations, ftd_count, deposits_sum, income/payout
+        totals.clicks += parseInt(row.clicks || row.click_count || 0);
+        totals.registrations += parseInt(row.registrations || row.registration_count || 0);
+        totals.ftds += parseInt(row.ftd_count || row.ftds || row.first_deposits || 0);
+        totals.deposits += parseFloat(row.deposits_sum || row.deposits || 0);
+        totals.revenue += parseFloat(row.income || row.payout || row.revenue || row.commission || 0);
+      }
+
+      return {
+        date: this.formatDate(startDate),
+        clicks: totals.clicks,
+        impressions: 0,
+        signups: totals.registrations,
+        ftds: totals.ftds,
+        deposits: Math.round(totals.deposits * 100), // Convert to cents
+        revenue: Math.round(totals.revenue * 100) // Convert to cents
+      };
+    };
+
+    // Fetch both months
+    const stats = [];
+
+    try {
+      const currentStats = await fetchAlanbaseStats(currentMonthStart, currentMonthEnd, 'current month');
+      this.log(`Current month: clicks=${currentStats.clicks}, signups=${currentStats.signups}, ftds=${currentStats.ftds}, revenue=$${currentStats.revenue/100}`);
+      stats.push(currentStats);
+    } catch (e) {
+      this.log(`Failed to fetch current month: ${e.message}`);
+      throw e;
+    }
+
+    try {
+      const lastStats = await fetchAlanbaseStats(lastMonthStart, lastMonthEnd, 'last month');
+      this.log(`Last month: clicks=${lastStats.clicks}, signups=${lastStats.signups}, ftds=${lastStats.ftds}, revenue=$${lastStats.revenue/100}`);
+      stats.push(lastStats);
+    } catch (e) {
+      this.log(`Failed to fetch last month: ${e.message}`);
+    }
+
+    this.log(`✓ Alanbase sync complete: ${stats.length} month(s) fetched`);
+    return stats;
+  }
+
+  // Affilka Scrape - web login fallback when no API token
+  async syncAffilkaScrape({ program, credentials, config, loginUrl, scraper }) {
     const scr = scraper || this.scraper; // Use dedicated scraper for parallel safety
-    const login = loginUrl || 'https://dashboard.7bitpartners.com/partner/login';
+    const login = loginUrl;
     const username = credentials.username;
     const password = credentials.password;
 
+    this.log(`syncAffilkaScrape called with loginUrl: ${login}`);
+    this.log(`Scraper instance: ${scr ? 'EXISTS' : 'NULL'}`);
+
     if (!username || !password) {
-      throw new Error('Username and password required for 7BitPartners scraping');
+      throw new Error('Username and password required for Affilka scraping');
     }
 
     const { startDate, endDate } = this.getDateRange(7);
 
-    this.log('Starting 7BitPartners web scrape...');
+    this.log(`Starting Affilka web scrape for ${login}...`);
 
     try {
-      const stats = await scr.scrape7BitPartners({
+      const stats = await scr.scrapeAffilka({
         loginUrl: login,
         username,
         password,
@@ -1630,6 +2721,229 @@ class SyncEngine {
       if (!this.inBatchMode) {
         await scr.closePages();
       }
+      throw error;
+    }
+  }
+
+  // Number 1 Affiliates - DevExtreme grid scraper
+  // One-off scraper for their monthly reports page
+  async syncNumber1Affiliates({ program, credentials, config, loginUrl, statsUrl, apiUrl, scraper }) {
+    const scr = scraper || this.scraper;
+    const login = loginUrl || config?.loginUrl;
+    // Stats URL can be in statsUrl, apiUrl, or config.apiUrl field
+    const stats = statsUrl || apiUrl || config?.statsUrl || config?.apiUrl;
+
+    if (!login) {
+      throw new Error('Number 1 Affiliates requires a login URL');
+    }
+
+    this.log('Starting Number 1 Affiliates scrape...');
+    await scr.launch();
+    const page = await scr.browser.newPage();
+
+    try {
+      // Step 1: Navigate to login
+      this.log(`Navigating to login: ${login}`);
+      await page.goto(login, { waitUntil: 'networkidle2', timeout: 30000 });
+      await scr.delay(2000);
+
+      // Step 2: Fill login form
+      const username = credentials.username;
+      const password = credentials.password;
+
+      if (!username || !password) {
+        throw new Error('Username and password required');
+      }
+
+      // Try common login selectors
+      const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[type="email"]', '#username', '#email', 'input[name="userName"]'];
+      const passwordSelectors = ['input[name="password"]', 'input[type="password"]', '#password'];
+
+      let usernameField = null;
+      for (const sel of usernameSelectors) {
+        usernameField = await page.$(sel);
+        if (usernameField) break;
+      }
+
+      let passwordField = null;
+      for (const sel of passwordSelectors) {
+        passwordField = await page.$(sel);
+        if (passwordField) break;
+      }
+
+      if (usernameField && passwordField) {
+        await usernameField.type(username, { delay: 50 });
+        await passwordField.type(password, { delay: 50 });
+
+        // Find and click submit
+        const submitBtn = await page.$('button[type="submit"], input[type="submit"], .btn-login, #loginBtn');
+        if (submitBtn) {
+          await submitBtn.click();
+        } else {
+          await page.keyboard.press('Enter');
+        }
+
+        await scr.delay(3000);
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+      }
+
+      this.log('✓ Logged in');
+
+      // Step 3: Navigate to stats page
+      if (stats) {
+        this.log(`Navigating to stats: ${stats}`);
+        await page.goto(stats, { waitUntil: 'networkidle2', timeout: 30000 });
+        await scr.delay(3000);
+      }
+
+      // Step 4: Click submit/search button to load data (date picker needs submit)
+      this.log('Looking for submit/search button...');
+      const submitClicked = await page.evaluate(() => {
+        // Common submit button selectors
+        const selectors = [
+          'button[type="submit"]',
+          'input[type="submit"]',
+          '.btn-primary',
+          '.btn-search',
+          '.btn-submit',
+          'button.submit',
+          '#btnSearch',
+          '#btnSubmit',
+          '#submitBtn',
+          'button:contains("Search")',
+          'button:contains("Submit")',
+          'button:contains("Apply")',
+          'button:contains("Go")',
+          'button:contains("Show")',
+          '.dx-button'
+        ];
+
+        for (const sel of selectors) {
+          try {
+            const btn = document.querySelector(sel);
+            if (btn && btn.offsetParent !== null) { // visible
+              btn.click();
+              return sel;
+            }
+          } catch (e) {}
+        }
+
+        // Also try finding button by text content
+        const buttons = document.querySelectorAll('button, input[type="button"], .btn');
+        for (const btn of buttons) {
+          const text = btn.textContent?.toLowerCase() || '';
+          if (text.includes('search') || text.includes('submit') || text.includes('apply') || text.includes('show') || text.includes('go')) {
+            btn.click();
+            return 'text: ' + text;
+          }
+        }
+
+        return null;
+      });
+
+      if (submitClicked) {
+        this.log(`Clicked submit button: ${submitClicked}`);
+        await scr.delay(3000); // Wait for data to load
+        await page.waitForResponse(response => response.status() === 200, { timeout: 10000 }).catch(() => {});
+        await scr.delay(2000);
+      } else {
+        this.log('No submit button found, data may already be loaded');
+      }
+
+      // Step 5: Wait for DevExtreme grid to load
+      this.log('Waiting for data grid...');
+      await page.waitForSelector('.dx-datagrid-rowsview', { timeout: 15000 });
+      await scr.delay(2000); // Extra wait for data to populate
+
+      // Step 5: Extract data from DevExtreme grid
+      this.log('Extracting stats from grid...');
+      const gridData = await page.evaluate(() => {
+        const results = [];
+        const rows = document.querySelectorAll('.dx-datagrid-rowsview .dx-data-row');
+
+        for (const row of rows) {
+          const cells = row.querySelectorAll('td[role="gridcell"]');
+          if (cells.length < 10) continue;
+
+          // Parse cell values by aria-colindex
+          const getCellValue = (colIndex) => {
+            for (const cell of cells) {
+              if (cell.getAttribute('aria-colindex') === String(colIndex)) {
+                return cell.textContent.trim();
+              }
+            }
+            return '';
+          };
+
+          const parseNumber = (text) => {
+            if (!text) return 0;
+            const cleaned = text.replace(/[$€£,\s]/g, '').replace(/[()]/g, '');
+            const num = parseFloat(cleaned) || 0;
+            return text.includes('-') ? -Math.abs(num) : num;
+          };
+
+          const date = getCellValue(2); // Date column
+          if (!date || !date.match(/^\d{4}-\d{2}-\d{2}$/)) continue;
+
+          results.push({
+            date: date,
+            clicks: parseInt(getCellValue(3).replace(/,/g, '')) || 0,
+            signups: parseInt(getCellValue(4).replace(/,/g, '')) || 0,
+            ftds: parseInt(getCellValue(5).replace(/,/g, '')) || 0,
+            deposits: parseNumber(getCellValue(8)), // Deposits amount (column 8)
+            withdrawals: parseNumber(getCellValue(10)), // Withdrawals amount
+            chargebacks: parseNumber(getCellValue(17)), // CB's amount
+            revenue: parseNumber(getCellValue(22)) // Earnings
+          });
+        }
+
+        return results;
+      });
+
+      this.log(`Found ${gridData.length} rows in grid`);
+
+      // Step 6: Filter for current month and last month only
+      const now = new Date();
+      const currentMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+      const lastMonth = now.getMonth() === 0
+        ? `${now.getFullYear() - 1}-12`
+        : `${now.getFullYear()}-${String(now.getMonth()).padStart(2, '0')}`;
+
+      this.log(`Looking for months: ${currentMonth} and ${lastMonth}`);
+
+      const allStats = [];
+      for (const row of gridData) {
+        const rowMonth = row.date.substring(0, 7); // YYYY-MM
+        if (rowMonth === currentMonth || rowMonth === lastMonth) {
+          // Convert to first of month format and cents
+          const statDate = `${rowMonth}-01`;
+          allStats.push({
+            date: statDate,
+            clicks: row.clicks,
+            impressions: 0,
+            signups: row.signups,
+            ftds: row.ftds,
+            deposits: Math.round(Math.abs(row.deposits) * 100), // Convert to cents
+            withdrawals: Math.round(Math.abs(row.withdrawals) * 100),
+            chargebacks: Math.round(Math.abs(row.chargebacks) * 100),
+            revenue: Math.round(row.revenue * 100) // Keep sign for revenue
+          });
+          this.log(`Found ${rowMonth}: clicks=${row.clicks}, signups=${row.signups}, ftds=${row.ftds}, deposits=$${row.deposits}, revenue=$${row.revenue}`);
+        }
+      }
+
+      await page.close();
+
+      if (allStats.length === 0) {
+        this.log('No data found for current/last month');
+      }
+
+      this.log(`✓ Number 1 Affiliates sync complete: ${allStats.length} month(s)`);
+      return allStats;
+
+    } catch (error) {
+      this.log(`Number 1 Affiliates error: ${error.message}`, 'error');
+      await page.close();
       throw error;
     }
   }

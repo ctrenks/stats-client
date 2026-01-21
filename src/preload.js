@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('api', {
   // Templates from server
   fetchTemplates: () => ipcRenderer.invoke('fetch-templates'),
   importTemplate: (template) => ipcRenderer.invoke('import-template', template),
+  syncAllProgramsToWeb: () => ipcRenderer.invoke('sync-all-programs-to-web'),
 
   // Stats
   getStats: (programId, startDate, endDate) => ipcRenderer.invoke('get-stats', programId, startDate, endDate),
@@ -29,7 +30,14 @@ contextBridge.exposeInMainWorld('api', {
   deleteStat: (statId) => ipcRenderer.invoke('delete-stat', statId),
   deleteStatsMonth: (programId, yearMonth) => ipcRenderer.invoke('delete-stats-month', programId, yearMonth),
   getMonthlyStats: (programId, startDate, endDate) => ipcRenderer.invoke('get-monthly-stats', programId, startDate, endDate),
+  getChannelStats: (programId, startDate, endDate) => ipcRenderer.invoke('get-channel-stats', programId, startDate, endDate),
+  getChannelsForProgram: (programId) => ipcRenderer.invoke('get-channels-for-program', programId),
   consolidateStats: (programId) => ipcRenderer.invoke('consolidate-stats', programId),
+
+  // Backup/restore
+  exportBackup: () => ipcRenderer.invoke('export-backup'),
+  importBackup: () => ipcRenderer.invoke('import-backup'),
+  getDataPaths: () => ipcRenderer.invoke('get-data-paths'),
 
   // Providers
   getProviders: () => ipcRenderer.invoke('get-providers'),
@@ -93,5 +101,21 @@ contextBridge.exposeInMainWorld('api', {
   getPaymentSummary: (monthsBack) => ipcRenderer.invoke('get-payment-summary', monthsBack),
   getProgramsWithRevenue: (month) => ipcRenderer.invoke('get-programs-with-revenue', month),
   togglePaymentStatus: (programId, month) => ipcRenderer.invoke('toggle-payment-status', programId, month),
-  updatePayment: (programId, month, data) => ipcRenderer.invoke('update-payment', programId, month, data)
+  updatePayment: (programId, month, data) => ipcRenderer.invoke('update-payment', programId, month, data),
+
+  // Scheduler
+  getSchedules: () => ipcRenderer.invoke('get-schedules'),
+  addSchedule: (time) => ipcRenderer.invoke('add-schedule', time),
+  removeSchedule: (id) => ipcRenderer.invoke('remove-schedule', id),
+  toggleSchedule: (id) => ipcRenderer.invoke('toggle-schedule', id),
+  getNextScheduledSync: () => ipcRenderer.invoke('get-next-scheduled-sync'),
+  onScheduledSyncStarted: (callback) => {
+    ipcRenderer.on('scheduled-sync-started', (event, data) => callback(data));
+  },
+  onScheduledSyncCompleted: (callback) => {
+    ipcRenderer.on('scheduled-sync-completed', (event, data) => callback(data));
+  },
+
+  // External links
+  openExternal: (url) => ipcRenderer.invoke('open-external', url)
 });

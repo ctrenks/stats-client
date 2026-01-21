@@ -76,12 +76,13 @@ let licenseInfo = {
   role: 0,
   roleLabel: 'invalid',
   lastChecked: null,
-  maxPrograms: 5  // Default to demo limit
+  maxPrograms: 20  // Default to demo limit (20 programs)
 };
 
 // Check interval (24 hours in ms)
 const LICENSE_CHECK_INTERVAL = 24 * 60 * 60 * 1000;
 let licenseCheckTimer = null;
+let schedulerInterval = null;
 
 // Configure auto-updater
 autoUpdater.autoDownload = false; // Don't auto-download, ask user first
@@ -176,7 +177,7 @@ async function validateApiKey(apiKey) {
               userId: data.userId,
               username: data.username,
               lastChecked: Date.now(),
-              maxPrograms: (data.role <= 1) ? 5 : Infinity,  // Demo = 5, Full/Admin = unlimited
+              maxPrograms: (data.role <= 1) ? 20 : Infinity,  // Demo = 20, Full/Admin = unlimited
               boundToDevice: data.boundToDevice
             };
             // Save to settings
@@ -188,7 +189,7 @@ async function validateApiKey(apiKey) {
           } else {
             licenseInfo.valid = false;
             licenseInfo.role = 0;
-            licenseInfo.maxPrograms = 5;
+            licenseInfo.maxPrograms = 20;
             // Check for installation mismatch
             if (data.code === 'INSTALLATION_MISMATCH') {
               resolve({ valid: false, error: data.error, code: 'INSTALLATION_MISMATCH' });
@@ -221,7 +222,7 @@ async function validateApiKey(apiKey) {
 
 // Check license and disable programs if invalid
 async function checkLicenseOnStartup() {
-  const apiKey = db.getSetting('api_key');
+  const apiKey = db.getSecureSetting('api_key');
   if (!apiKey) {
     console.log('[LICENSE] No API key configured');
     sendLicenseStatus({ valid: false, error: 'No API key configured' });
@@ -271,7 +272,7 @@ function startLicenseCheckTimer() {
   }
 
   licenseCheckTimer = setInterval(async () => {
-    const apiKey = db.getSetting('api_key');
+    const apiKey = db.getSecureSetting('api_key');
     if (apiKey) {
       const result = await validateApiKey(apiKey);
       if (!result.valid && !result.cached) {
@@ -280,6 +281,86 @@ function startLicenseCheckTimer() {
       sendLicenseStatus(result);
     }
   }, LICENSE_CHECK_INTERVAL);
+}
+
+// =====================
+// Scheduler Functions
+// =====================
+
+// Get the next scheduled sync time
+function getNextScheduledSync() {
+  if (!db) return null;
+
+  const schedules = db.getEnabledSchedules();
+  if (schedules.length === 0) return null;
+
+  const now = new Date();
+  const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+  // Find the next scheduled time
+  for (const schedule of schedules) {
+    if (schedule.time > currentTime) {
+      return { time: schedule.time, isToday: true };
+    }
+  }
+
+  // All scheduled times are earlier today, so next is tomorrow's first schedule
+  return { time: schedules[0].time, isToday: false };
+}
+
+// Start the scheduler - checks every minute
+function startScheduler() {
+  if (schedulerInterval) {
+    clearInterval(schedulerInterval);
+  }
+
+  console.log('[SCHEDULER] Starting scheduler...');
+
+  // Check every 60 seconds
+  schedulerInterval = setInterval(async () => {
+    if (!db) return;
+
+    const now = new Date();
+    const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+    const schedules = db.getEnabledSchedules();
+
+    for (const schedule of schedules) {
+      if (schedule.time === currentTime) {
+        // Check if already ran this minute
+        const lastRun = schedule.last_run ? new Date(schedule.last_run) : null;
+        if (lastRun && (now - lastRun) < 60000) {
+          continue; // Skip if ran within last minute
+        }
+
+        console.log(`[SCHEDULER] Triggering scheduled sync at ${currentTime}`);
+        db.updateScheduleLastRun(schedule.id, now.toISOString());
+
+        // Notify renderer
+        if (mainWindow && mainWindow.webContents) {
+          mainWindow.webContents.send('scheduled-sync-started', { time: currentTime });
+        }
+
+        // Run sync
+        try {
+          if (syncEngine) {
+            await syncEngine.syncAll();
+          }
+        } catch (err) {
+          console.error('[SCHEDULER] Sync failed:', err);
+        }
+
+        // Notify renderer sync completed
+        if (mainWindow && mainWindow.webContents) {
+          mainWindow.webContents.send('scheduled-sync-completed', { time: currentTime });
+        }
+
+        break; // Only run once per minute even if multiple schedules match
+      }
+    }
+  }, 60000); // Every minute
+
+  console.log('[SCHEDULER] Scheduler started');
 }
 
 // Check if can add more programs (based on role)
@@ -341,7 +422,6 @@ const SOFTWARE_TO_PROVIDER = {
   'netrefer': 'NETREFER',
   'wynta': 'WYNTA',
   'affilka': 'AFFILKA',
-  '7bitpartners': '7BITPARTNERS',
   'deckmedia': 'DECKMEDIA',
   'rtg': 'RTG',
   'rtg-original': 'RTG_ORIGINAL',
@@ -350,10 +430,99 @@ const SOFTWARE_TO_PROVIDER = {
   'custom': 'CUSTOM'
 };
 
-// Fetch templates from statsfetch.com API
+// Upload stats to the web server
+async function uploadStatsToServer(apiKey, stats) {
+  return new Promise((resolve) => {
+    const request = net.request({
+      method: 'POST',
+      url: `${API_URL}/api/client/stats/upload`,
+    });
+
+    request.setHeader('Content-Type', 'application/json');
+    request.setHeader('X-API-Key', apiKey);
+
+    let responseData = '';
+
+    request.on('response', (response) => {
+      response.on('data', (chunk) => {
+        responseData += chunk.toString();
+      });
+
+      response.on('end', () => {
+        try {
+          const data = JSON.parse(responseData);
+          resolve(data);
+        } catch (e) {
+          resolve({ success: false, error: 'Failed to parse response' });
+        }
+      });
+    });
+
+    request.on('error', (error) => {
+      console.error('[UPLOAD] Network error:', error.message);
+      resolve({ success: false, error: error.message });
+    });
+
+    request.write(JSON.stringify({ stats }));
+    request.end();
+  });
+}
+
+// Sync program selection to the web server (when importing a template)
+async function syncProgramToServer(apiKey, programCode, programName, action = 'add') {
+  return new Promise((resolve) => {
+    const request = net.request({
+      method: 'POST',
+      url: `${API_URL}/api/client/programs/sync`,
+    });
+
+    request.setHeader('Content-Type', 'application/json');
+    request.setHeader('X-API-Key', apiKey);
+
+    let responseData = '';
+
+    request.on('response', (response) => {
+      response.on('data', (chunk) => {
+        responseData += chunk.toString();
+      });
+
+      response.on('end', () => {
+        try {
+          const data = JSON.parse(responseData);
+          resolve(data);
+        } catch (e) {
+          resolve({ success: false, error: 'Failed to parse response' });
+        }
+      });
+    });
+
+    request.on('error', (error) => {
+      console.error('[PROGRAM SYNC] Network error:', error.message);
+      resolve({ success: false, error: error.message });
+    });
+
+    request.write(JSON.stringify({ programCode, programName, action }));
+    request.end();
+  });
+}
+
+// Fetch templates from statsfetch.com API (authenticated with API key for user selections)
 async function fetchTemplates() {
+  const apiKey = db.getSecureSetting('api_key');
+
   return new Promise((resolve, reject) => {
-    const request = net.request(`${API_URL}/api/templates`);
+    // Use authenticated endpoint to get user's web selections
+    const url = apiKey
+      ? `${API_URL}/api/client/templates`
+      : `${API_URL}/api/templates`;
+
+    const request = net.request(url);
+
+    // Add API key header if available
+    if (apiKey) {
+      request.setHeader('X-API-Key', apiKey);
+    }
+
     let data = '';
 
     request.on('response', (response) => {
@@ -385,7 +554,17 @@ async function fetchTemplates() {
               baseUrl: t.baseUrl || ''
             },
             description: t.description,
-            icon: t.icon
+            icon: t.icon,
+            referralUrl: t.referralUrl || '',
+            isSelected: t.isSelected || false,
+            // OAuth and label settings
+            supportsOAuth: t.supportsOAuth || false,
+            apiKeyLabel: t.apiKeyLabel,
+            apiSecretLabel: t.apiSecretLabel,
+            usernameLabel: t.usernameLabel,
+            passwordLabel: t.passwordLabel,
+            baseUrlLabel: t.baseUrlLabel,
+            requiresBaseUrl: t.requiresBaseUrl || false
           }));
 
           resolve(templates);
@@ -456,7 +635,7 @@ async function initialize() {
   const cachedLastChecked = db.getSetting('license_last_checked');
   if (cachedRole) {
     licenseInfo.role = parseInt(cachedRole, 10);
-    licenseInfo.maxPrograms = (licenseInfo.role <= 1) ? 5 : Infinity;
+    licenseInfo.maxPrograms = (licenseInfo.role <= 1) ? 20 : Infinity;
     licenseInfo.lastChecked = cachedLastChecked ? parseInt(cachedLastChecked, 10) : null;
   }
 
@@ -465,6 +644,9 @@ async function initialize() {
 
   // Start periodic license check (every 24 hours)
   startLicenseCheckTimer();
+
+  // Start the sync scheduler
+  startScheduler();
 }
 
 // IPC Handlers
@@ -516,6 +698,25 @@ function setupIpcHandlers() {
   ipcMain.handle('fetch-templates', async () => {
     try {
       const templates = await fetchTemplates();
+
+      // Auto-sync existing programs to web (mark as "installed")
+      const apiKey = db.getSecureSetting('api_key');
+      if (apiKey) {
+        const programs = db.getPrograms();
+        if (programs && programs.length > 0) {
+          console.log(`[AUTO SYNC] Syncing ${programs.length} installed programs to web...`);
+          for (const program of programs) {
+            try {
+              const programCode = program.template || program.name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+              await syncProgramToServer(apiKey, programCode, program.name, 'import');
+            } catch (e) {
+              // Ignore individual sync errors
+            }
+          }
+          console.log('[AUTO SYNC] Sync complete');
+        }
+      }
+
       return { success: true, templates };
     } catch (error) {
       console.error('Failed to fetch templates:', error);
@@ -525,7 +726,71 @@ function setupIpcHandlers() {
 
   // Import template as local program
   ipcMain.handle('import-template', async (event, template) => {
-    return db.importTemplate(template);
+    const result = db.importTemplate(template);
+
+    // If template sync is enabled, also sync to web
+    if (result && result.id) {
+      const templateSyncEnabled = db.getSetting('templateSyncEnabled');
+      const apiKey = db.getSecureSetting('api_key');
+
+      if (templateSyncEnabled === 'true' && apiKey) {
+        console.log('[TEMPLATE SYNC] Syncing imported program to web dashboard...');
+        try {
+          const syncResult = await syncProgramToServer(
+            apiKey,
+            template.code || template.name.toLowerCase().replace(/[^a-z0-9]/g, '-'),
+            template.name,
+            'import'
+          );
+          if (syncResult.synced) {
+            console.log(`[TEMPLATE SYNC] Program "${template.name}" synced to web selections`);
+          }
+        } catch (error) {
+          console.error('[TEMPLATE SYNC] Error:', error.message);
+        }
+      }
+    }
+
+    return result;
+  });
+
+  // Sync all existing programs to web (mark as "installed" on web)
+  ipcMain.handle('sync-all-programs-to-web', async () => {
+    const apiKey = db.getSecureSetting('api_key');
+    if (!apiKey) {
+      return { success: false, error: 'API key not configured' };
+    }
+
+    const programs = db.getPrograms();
+    if (!programs || programs.length === 0) {
+      return { success: false, error: 'No programs to sync' };
+    }
+
+    let syncedCount = 0;
+    const errors = [];
+
+    for (const program of programs) {
+      try {
+        const programCode = program.template || program.name.toLowerCase().replace(/[^a-z0-9]/g, '-');
+        const result = await syncProgramToServer(apiKey, programCode, program.name, 'import');
+        if (result.synced) {
+          syncedCount++;
+          console.log(`[SYNC ALL] Synced: ${program.name}`);
+        } else {
+          console.log(`[SYNC ALL] No match for: ${program.name}`);
+        }
+      } catch (error) {
+        errors.push(`${program.name}: ${error.message}`);
+        console.error(`[SYNC ALL] Error syncing ${program.name}:`, error.message);
+      }
+    }
+
+    return {
+      success: true,
+      syncedCount,
+      totalCount: programs.length,
+      errors: errors.length > 0 ? errors : undefined,
+    };
   });
 
   // Get stats for a program
@@ -553,6 +818,16 @@ function setupIpcHandlers() {
     return db.getMonthlyStats(programId, startDate, endDate);
   });
 
+  // Get per-channel stats breakdown
+  ipcMain.handle('get-channel-stats', async (event, programId, startDate, endDate) => {
+    return db.getChannelStats(programId, startDate, endDate);
+  });
+
+  // Get list of channels for a program
+  ipcMain.handle('get-channels-for-program', async (event, programId) => {
+    return db.getChannelsForProgram(programId);
+  });
+
   // Consolidate duplicate monthly stats
   ipcMain.handle('consolidate-stats', async (event, programId) => {
     return db.consolidateMonthlyStats(programId);
@@ -563,23 +838,78 @@ function setupIpcHandlers() {
     return db.getStatsSummary();
   });
 
+  // Export backup (database + encryption key)
+  ipcMain.handle('export-backup', async () => {
+    try {
+      const backupData = db.exportBackup();
+      // Show save dialog
+      const { dialog } = require('electron');
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: 'Export Database Backup',
+        defaultPath: `stats-fetch-backup-${new Date().toISOString().split('T')[0]}.json`,
+        filters: [{ name: 'Backup Files', extensions: ['json'] }]
+      });
+
+      if (!result.canceled && result.filePath) {
+        const fs = require('fs');
+        fs.writeFileSync(result.filePath, backupData);
+        return { success: true, path: result.filePath };
+      }
+      return { success: false, cancelled: true };
+    } catch (error) {
+      console.error('Export backup error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // Import backup (database + encryption key)
+  ipcMain.handle('import-backup', async () => {
+    try {
+      const { dialog } = require('electron');
+      const result = await dialog.showOpenDialog(mainWindow, {
+        title: 'Import Database Backup',
+        filters: [{ name: 'Backup Files', extensions: ['json'] }],
+        properties: ['openFile']
+      });
+
+      if (!result.canceled && result.filePaths.length > 0) {
+        const fs = require('fs');
+        const backupData = fs.readFileSync(result.filePaths[0], 'utf8');
+        const importResult = db.importBackup(backupData);
+        return { success: true, ...importResult };
+      }
+      return { success: false, cancelled: true };
+    } catch (error) {
+      console.error('Import backup error:', error);
+      return { success: false, error: error.message };
+    }
+  });
+
+  // Get data paths for info display
+  ipcMain.handle('get-data-paths', async () => {
+    return db.getDataPaths();
+  });
+
   // Get available provider/software types for the dropdown
   // These are the SOFTWARE TYPES (RTG, CellXpert, etc.), not individual program templates
   ipcMain.handle('get-providers', async () => {
     // Software types - these are the scraper/sync engine types
     const providers = [
-      { code: 'CELLXPERT', name: 'CellXpert', authType: 'CREDENTIALS', icon: '📊' },
-      { code: 'MYAFFILIATES', name: 'MyAffiliates', authType: 'CREDENTIALS', icon: '🤝' },
+      { code: 'CELLXPERT', name: 'CellXpert', authType: 'BOTH', icon: '📊', supportsAPI: true, apiKeyLabel: 'API Key', apiIdLabel: 'Affiliate ID (in Username field)' },
+      { code: 'MYAFFILIATES', name: 'MyAffiliates', authType: 'BOTH', icon: '🤝', supportsOAuth: true, apiKeyLabel: 'Client ID', apiSecretLabel: 'Client Secret' },
       { code: 'INCOME_ACCESS', name: 'Income Access', authType: 'CREDENTIALS', icon: '💰' },
-      { code: 'NETREFER', name: 'NetRefer', authType: 'API_KEY', icon: '🌐', apiKeyLabel: 'API Key' },
+      { code: 'NETREFER', name: 'NetRefer', authType: 'CREDENTIALS', icon: '🌐', description: 'Login and scrape MonthlyFigures report' },
+      { code: 'EGO', name: 'EGO', authType: 'CREDENTIALS', icon: '🎭', description: 'Login and scrape stats with datepicker' },
+      { code: 'MEXOS', name: 'Mexos', authType: 'CREDENTIALS', icon: '📊', description: 'Angular SPA - Login and scrape Traffic Stats' },
       { code: 'WYNTA', name: 'Wynta', authType: 'CREDENTIALS', icon: '🎲' },
       { code: 'AFFILKA', name: 'Affilka', authType: 'BOTH', icon: '🔗', requiresBaseUrl: true, baseUrlLabel: 'Affiliate Dashboard URL', apiKeyLabel: 'Statistic Token' },
-      { code: '7BITPARTNERS', name: '7BitPartners', authType: 'BOTH', icon: '🎰', baseUrl: 'https://dashboard.7bitpartners.com', apiKeyLabel: 'Statistic Token' },
+      { code: 'ALANBASE', name: 'Alanbase', authType: 'API_KEY', icon: '📊', requiresBaseUrl: true, baseUrlLabel: 'API Domain (e.g., https://api.domain.com)', apiKeyLabel: 'API Key' },
       { code: 'DECKMEDIA', name: 'DeckMedia', authType: 'CREDENTIALS', icon: '🃏' },
       { code: 'RTG', name: 'RTG (New)', authType: 'CREDENTIALS', icon: '🎮', description: 'RTG new dashboard - scrapes stats panels' },
       { code: 'RTG_ORIGINAL', name: 'RTG Original', authType: 'CREDENTIALS', icon: '🕹️', description: 'Supports D-W-C revenue calculation' },
       { code: 'RIVAL', name: 'Rival (CasinoController)', authType: 'CREDENTIALS', icon: '🎯', description: 'Syncs sequentially to avoid rate limits' },
       { code: 'CASINO_REWARDS', name: 'Casino Rewards', authType: 'CREDENTIALS', icon: '🏆' },
+      { code: 'NUMBER1AFFILIATES', name: 'Number 1 Affiliates', authType: 'CREDENTIALS', icon: '🔢', description: 'Custom scraper for monthly reports' },
       { code: 'PARTNERMATRIX', name: 'PartnerMatrix', authType: 'CREDENTIALS', icon: '📈' },
       { code: 'SCALEO', name: 'Scaleo', authType: 'API_KEY', icon: '⚡', apiKeyLabel: 'API Key' },
       { code: 'CUSTOM', name: 'Custom / Other', authType: 'CREDENTIALS', icon: '⚙️' }
@@ -591,7 +921,33 @@ function setupIpcHandlers() {
   // Sync all programs
   ipcMain.handle('sync-all', async () => {
     try {
-      const result = await syncEngine.syncAll();
+      // Pass program limit for demo accounts
+      const result = await syncEngine.syncAll(licenseInfo.maxPrograms);
+
+      // If stats upload is enabled and we have pending data, upload it
+      if (result.pendingStatsUpload && result.pendingStatsUpload.length > 0) {
+        const apiKey = db.getSecureSetting('api_key');
+        if (apiKey) {
+          console.log('[STATS UPLOAD] Uploading stats to web dashboard...');
+          try {
+            const uploadResult = await uploadStatsToServer(apiKey, result.pendingStatsUpload);
+            if (uploadResult.success) {
+              console.log(`[STATS UPLOAD] Successfully uploaded ${uploadResult.saved} program stats`);
+              if (mainWindow && mainWindow.webContents) {
+                mainWindow.webContents.send('sync-log', {
+                  message: `📤 Uploaded stats for ${uploadResult.saved} programs to web dashboard`,
+                  type: 'success'
+                });
+              }
+            } else {
+              console.error('[STATS UPLOAD] Upload failed:', uploadResult.error);
+            }
+          } catch (uploadError) {
+            console.error('[STATS UPLOAD] Error:', uploadError.message);
+          }
+        }
+      }
+
       return result;
     } catch (error) {
       console.error('Sync error:', error);
@@ -638,8 +994,8 @@ function setupIpcHandlers() {
 
   // License/API key handlers
   ipcMain.handle('validate-api-key', async (event, apiKey) => {
-    // Save the API key first
-    db.setSetting('api_key', apiKey);
+    // Save the API key first (encrypted)
+    db.setSecureSetting('api_key', apiKey);
     // Validate it
     const result = await validateApiKey(apiKey);
     return result;
@@ -657,14 +1013,14 @@ function setupIpcHandlers() {
   });
 
   ipcMain.handle('get-api-key', async () => {
-    return db.getSetting('api_key') || '';
+    return db.getSecureSetting('api_key') || '';
   });
 
   ipcMain.handle('clear-api-key', async () => {
-    db.setSetting('api_key', '');
+    db.setSecureSetting('api_key', '');
     licenseInfo.valid = false;
     licenseInfo.role = 0;
-    licenseInfo.maxPrograms = 5;
+    licenseInfo.maxPrograms = 20;
     return { success: true };
   });
 
@@ -692,6 +1048,48 @@ function setupIpcHandlers() {
 
   ipcMain.handle('update-payment', async (event, programId, month, data) => {
     return db.upsertPayment(programId, month, data);
+  });
+
+  // Schedule handlers
+  ipcMain.handle('get-schedules', async () => {
+    return db.getSchedules();
+  });
+
+  ipcMain.handle('add-schedule', async (event, time) => {
+    const result = db.addSchedule(time);
+    if (result.success) {
+      // Restart scheduler to pick up new schedule
+      startScheduler();
+    }
+    return result;
+  });
+
+  ipcMain.handle('remove-schedule', async (event, id) => {
+    const result = db.removeSchedule(id);
+    startScheduler(); // Restart scheduler
+    return result;
+  });
+
+  ipcMain.handle('toggle-schedule', async (event, id) => {
+    const result = db.toggleSchedule(id);
+    startScheduler(); // Restart scheduler
+    return result;
+  });
+
+  ipcMain.handle('get-next-scheduled-sync', async () => {
+    return getNextScheduledSync();
+  });
+
+  // Open external URL in browser
+  ipcMain.handle('open-external', async (event, url) => {
+    const { shell } = require('electron');
+    try {
+      await shell.openExternal(url);
+      return { success: true };
+    } catch (error) {
+      console.error('Failed to open external URL:', error);
+      return { success: false, error: error.message };
+    }
   });
 
   // Auto-updater IPC handlers
@@ -749,8 +1147,37 @@ app.on('window-all-closed', () => {
   }
 });
 
-app.on('before-quit', () => {
+app.on('before-quit', async () => {
+  console.log('[CLEANUP] App quitting, cleaning up resources...');
+
+  // Close any running browsers from sync engine
+  if (syncEngine && syncEngine.scraper) {
+    try {
+      console.log('[CLEANUP] Closing scraper browser...');
+      await syncEngine.scraper.close();
+    } catch (e) {
+      console.error('[CLEANUP] Error closing scraper:', e.message);
+    }
+  }
+
+  // Close database
   if (db) {
+    console.log('[CLEANUP] Closing database...');
     db.close();
   }
+
+  console.log('[CLEANUP] Cleanup complete');
+});
+
+// Also handle uncaught exceptions to ensure cleanup
+process.on('uncaughtException', async (error) => {
+  console.error('[FATAL] Uncaught exception:', error);
+  if (syncEngine && syncEngine.scraper) {
+    try {
+      await syncEngine.scraper.close();
+    } catch (e) {
+      // Ignore
+    }
+  }
+  process.exit(1);
 });

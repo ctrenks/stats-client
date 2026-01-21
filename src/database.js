@@ -36,15 +36,15 @@ class Database {
   }
 
   getOrCreateEncryptionKey(userDataPath) {
-    const keyPath = path.join(userDataPath, ".encryption-key");
+    this.keyPath = path.join(userDataPath, ".encryption-key");
 
     // Ensure directory exists
     if (!fs.existsSync(userDataPath)) {
       fs.mkdirSync(userDataPath, { recursive: true });
     }
 
-    if (fs.existsSync(keyPath)) {
-      return fs.readFileSync(keyPath, "utf8");
+    if (fs.existsSync(this.keyPath)) {
+      return fs.readFileSync(this.keyPath, "utf8");
     }
 
     const key = crypto.randomBytes(32).toString("hex");
@@ -154,6 +154,61 @@ class Database {
       // Column may already exist
     }
 
+    // Migration: Clean up duplicate stats records (keep the one with highest values)
+    // This fixes databases where UNIQUE constraint wasn't enforced
+    try {
+      // Find and delete duplicates, keeping the record with highest revenue (most complete data)
+      this.db.run(`
+        DELETE FROM stats
+        WHERE id NOT IN (
+          SELECT id FROM (
+            SELECT id, ROW_NUMBER() OVER (
+              PARTITION BY program_id, date
+              ORDER BY revenue DESC, clicks DESC, created_at DESC
+            ) as rn
+            FROM stats
+          ) WHERE rn = 1
+        )
+      `);
+    } catch (e) {
+      // May fail on older SQLite versions, that's OK
+    }
+
+    // Create unique index to enforce constraint on old databases
+    try {
+      this.db.run("CREATE UNIQUE INDEX IF NOT EXISTS idx_stats_unique_program_date ON stats(program_id, date)");
+    } catch (e) {
+      // May fail if duplicates still exist
+    }
+
+    // Create separate table for per-channel stats (avoids UNIQUE constraint issues)
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS channel_stats (
+        id TEXT PRIMARY KEY,
+        program_id TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        date TEXT NOT NULL,
+        clicks INTEGER DEFAULT 0,
+        impressions INTEGER DEFAULT 0,
+        signups INTEGER DEFAULT 0,
+        ftds INTEGER DEFAULT 0,
+        deposits INTEGER DEFAULT 0,
+        withdrawals INTEGER DEFAULT 0,
+        chargebacks INTEGER DEFAULT 0,
+        revenue INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (program_id) REFERENCES programs(id) ON DELETE CASCADE,
+        UNIQUE(program_id, channel, date)
+      )
+    `);
+
+    // Create index for channel lookups
+    try {
+      this.db.run("CREATE INDEX IF NOT EXISTS idx_channel_stats_program ON channel_stats(program_id)");
+    } catch (e) {
+      // Index may already exist
+    }
+
     // Payment tracking table
     this.db.run(`
       CREATE TABLE IF NOT EXISTS payments (
@@ -179,6 +234,17 @@ class Database {
     } catch (e) {
       // Index may already exist
     }
+
+    // Scheduled syncs table
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS schedules (
+        id TEXT PRIMARY KEY,
+        time TEXT NOT NULL,
+        enabled INTEGER DEFAULT 1,
+        last_run TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
   }
 
   save() {
@@ -256,7 +322,20 @@ class Database {
 
   // Programs CRUD
   getPrograms() {
-    return this.query("SELECT * FROM programs ORDER BY name");
+    // Get programs with credential status
+    const programs = this.query("SELECT * FROM programs ORDER BY name");
+
+    // Add has_credentials flag for each program
+    return programs.map(p => {
+      const creds = this.queryOne(
+        "SELECT id FROM credentials WHERE program_id = ?",
+        [p.id]
+      );
+      return {
+        ...p,
+        has_credentials: !!creds
+      };
+    });
   }
 
   getProgram(id) {
@@ -562,6 +641,18 @@ class Database {
     const apiUrl =
       template.apiUrl || template.config?.apiUrl || template.config?.baseUrl;
 
+    // Build config with OAuth and label settings
+    const config = {
+      ...(template.config || {}),
+      supportsOAuth: template.supportsOAuth || false,
+      apiKeyLabel: template.apiKeyLabel,
+      apiSecretLabel: template.apiSecretLabel,
+      usernameLabel: template.usernameLabel,
+      passwordLabel: template.passwordLabel,
+      baseUrlLabel: template.baseUrlLabel,
+      requiresBaseUrl: template.requiresBaseUrl,
+    };
+
     return this.createProgram({
       name: template.name,
       code: template.code,
@@ -570,7 +661,7 @@ class Database {
       loginUrl: loginUrl,
       statsUrl: statsUrl,
       apiUrl: apiUrl,
-      config: template.config,
+      config: config,
     });
   }
 
@@ -624,10 +715,43 @@ class Database {
 
   saveStats(programId, stats) {
     const id = this.generateId();
+    const channel = stats.channel || null;
 
-    // Use proper UPSERT with ON CONFLICT to avoid race conditions
-    // If a record with the same program_id + date exists, update it
-    // Otherwise, insert a new record
+    // If channel is provided, save to channel_stats table (separate table for per-channel breakdown)
+    if (channel) {
+      this.run(
+        `
+        INSERT INTO channel_stats (id, program_id, channel, date, clicks, impressions, signups, ftds, deposits, withdrawals, chargebacks, revenue)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(program_id, channel, date) DO UPDATE SET
+          clicks = excluded.clicks,
+          impressions = excluded.impressions,
+          signups = excluded.signups,
+          ftds = excluded.ftds,
+          deposits = excluded.deposits,
+          withdrawals = excluded.withdrawals,
+          chargebacks = excluded.chargebacks,
+          revenue = excluded.revenue
+      `,
+        [
+          id,
+          programId,
+          channel,
+          stats.date,
+          stats.clicks || 0,
+          stats.impressions || 0,
+          stats.signups || 0,
+          stats.ftds || 0,
+          stats.deposits || 0,
+          stats.withdrawals || 0,
+          stats.chargebacks || 0,
+          stats.revenue || 0,
+        ]
+      );
+      return;
+    }
+
+    // No channel - use regular UPSERT on program_id + date (for aggregated totals)
     this.run(
       `
       INSERT INTO stats (id, program_id, date, clicks, impressions, signups, ftds, deposits, withdrawals, chargebacks, revenue)
@@ -709,15 +833,67 @@ class Database {
     return this.query(sql, params);
   }
 
+  // Get per-channel breakdown for a program (from channel_stats table)
+  getChannelStats(programId, startDate = null, endDate = null) {
+    let sql = `
+      SELECT
+        channel,
+        strftime('%Y-%m', date) as month,
+        SUM(clicks) as clicks,
+        SUM(impressions) as impressions,
+        SUM(signups) as signups,
+        SUM(ftds) as ftds,
+        SUM(deposits) as deposits,
+        SUM(withdrawals) as withdrawals,
+        SUM(chargebacks) as chargebacks,
+        SUM(revenue) as revenue
+      FROM channel_stats
+      WHERE program_id = ?
+    `;
+    const params = [programId];
+
+    if (startDate) {
+      sql += " AND date >= ?";
+      params.push(startDate);
+    }
+    if (endDate) {
+      sql += " AND date <= ?";
+      params.push(endDate);
+    }
+
+    sql += " GROUP BY channel, strftime('%Y-%m', date) ORDER BY month DESC, channel";
+
+    return this.query(sql, params);
+  }
+
+  // Get list of unique channels for a program
+  getChannelsForProgram(programId) {
+    return this.query(
+      `SELECT DISTINCT channel FROM channel_stats WHERE program_id = ? ORDER BY channel`,
+      [programId]
+    );
+  }
+
+  // Clear all channel-specific records for a program (before re-syncing)
+  clearChannelStats(programId) {
+    this.run(
+      `DELETE FROM channel_stats WHERE program_id = ?`,
+      [programId]
+    );
+  }
+
   // Consolidate stats: keep only the latest record per month for a program
-  // Uses the LATEST values (not SUM) since monthly stats should overwrite, not accumulate
+  // SUMs all daily values into a single monthly record
+  // NOTE: Only consolidates records WITHOUT a channel (channel IS NULL)
+  // Per-channel records are kept separate for drill-down
+  // Uses MAX instead of SUM because most scrapers return cumulative monthly totals
   consolidateMonthlyStats(programId) {
-    // Get all months with multiple records
+    // Get all months with multiple records (only for non-channel records)
     const duplicates = this.query(
       `
       SELECT strftime('%Y-%m', date) as month, COUNT(*) as count
       FROM stats
-      WHERE program_id = ?
+      WHERE program_id = ? AND channel IS NULL
       GROUP BY strftime('%Y-%m', date)
       HAVING count > 1
     `,
@@ -726,30 +902,27 @@ class Database {
 
     let consolidated = 0;
     for (const dup of duplicates) {
-      // Get the LATEST record for this month (by date, then by rowid for same-day)
-      // Monthly stats should use latest values, not sums - multiple syncs overwrite, not accumulate
-      const latest = this.queryOne(
+      // Use MAX for all values - cumulative totals should take highest value, not sum
+      // This prevents doubling when syncing the same month multiple times
+      const totals = this.queryOne(
         `
         SELECT
-          date as latest_date,
-          clicks,
-          impressions,
-          signups,
-          ftds,
-          deposits,
-          withdrawals,
-          chargebacks,
-          revenue
+          MAX(clicks) as clicks,
+          MAX(impressions) as impressions,
+          MAX(signups) as signups,
+          MAX(ftds) as ftds,
+          MAX(deposits) as deposits,
+          MAX(withdrawals) as withdrawals,
+          MAX(chargebacks) as chargebacks,
+          MAX(revenue) as revenue
         FROM stats
-        WHERE program_id = ? AND date LIKE ?
-        ORDER BY date DESC, rowid DESC
-        LIMIT 1
+        WHERE program_id = ? AND date LIKE ? AND channel IS NULL
       `,
         [programId, `${dup.month}%`]
       );
 
-      // Delete all records for this month
-      this.run("DELETE FROM stats WHERE program_id = ? AND date LIKE ?", [
+      // Delete all records for this month (only non-channel records)
+      this.run("DELETE FROM stats WHERE program_id = ? AND date LIKE ? AND channel IS NULL", [
         programId,
         `${dup.month}%`,
       ]);
@@ -765,14 +938,14 @@ class Database {
           id,
           programId,
           `${dup.month}-01`,
-          latest.clicks || 0,
-          latest.impressions || 0,
-          latest.signups || 0,
-          latest.ftds || 0,
-          latest.deposits || 0,
-          latest.withdrawals || 0,
-          latest.chargebacks || 0,
-          latest.revenue || 0,
+          totals.clicks || 0,
+          totals.impressions || 0,
+          totals.signups || 0,
+          totals.ftds || 0,
+          totals.deposits || 0,
+          totals.withdrawals || 0,
+          totals.chargebacks || 0,
+          totals.revenue || 0,
         ]
       );
 
@@ -826,6 +999,56 @@ class Database {
       value,
     ]);
     return true;
+  }
+
+  // Sensitive settings that need encryption (API keys, tokens, etc.)
+  SENSITIVE_KEYS = ['api_key', 'installation_id', 'license_data'];
+
+  // Get encrypted setting
+  getSecureSetting(key) {
+    const row = this.queryOne("SELECT value FROM settings WHERE key = ?", [
+      key,
+    ]);
+    if (!row || !row.value) return null;
+
+    // Check if value looks encrypted (has IV:encrypted format)
+    if (row.value.includes(':')) {
+      try {
+        const decrypted = this.decrypt(row.value);
+        return decrypted;
+      } catch (e) {
+        // If decryption fails, return raw value (legacy unencrypted data)
+        return row.value;
+      }
+    }
+    // Return raw value for legacy unencrypted data
+    return row.value;
+  }
+
+  // Set encrypted setting
+  setSecureSetting(key, value) {
+    const encrypted = this.encrypt(value);
+    this.run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", [
+      key,
+      encrypted,
+    ]);
+    return true;
+  }
+
+  // Smart getter - uses encryption for sensitive keys
+  getSettingSmart(key) {
+    if (this.SENSITIVE_KEYS.includes(key)) {
+      return this.getSecureSetting(key);
+    }
+    return this.getSetting(key);
+  }
+
+  // Smart setter - uses encryption for sensitive keys
+  setSettingSmart(key, value) {
+    if (this.SENSITIVE_KEYS.includes(key)) {
+      return this.setSecureSetting(key, value);
+    }
+    return this.setSetting(key, value);
   }
 
   // Get programs categorized by status
@@ -1013,6 +1236,126 @@ class Database {
     }
 
     return months;
+  }
+
+  // =====================
+  // Schedule Management
+  // =====================
+
+  // Get all schedules
+  getSchedules() {
+    return this.query("SELECT * FROM schedules ORDER BY time ASC");
+  }
+
+  // Add a new schedule
+  addSchedule(time) {
+    // Check if time already exists
+    const existing = this.queryOne("SELECT id FROM schedules WHERE time = ?", [time]);
+    if (existing) {
+      return { success: false, error: "This time is already scheduled" };
+    }
+
+    const id = this.generateId();
+    this.run(
+      "INSERT INTO schedules (id, time, enabled) VALUES (?, ?, 1)",
+      [id, time]
+    );
+    return { success: true, id, time };
+  }
+
+  // Remove a schedule
+  removeSchedule(id) {
+    this.run("DELETE FROM schedules WHERE id = ?", [id]);
+    return { success: true };
+  }
+
+  // Toggle schedule enabled/disabled
+  toggleSchedule(id) {
+    const schedule = this.queryOne("SELECT * FROM schedules WHERE id = ?", [id]);
+    if (!schedule) {
+      return { success: false, error: "Schedule not found" };
+    }
+
+    const newEnabled = schedule.enabled ? 0 : 1;
+    this.run("UPDATE schedules SET enabled = ? WHERE id = ?", [newEnabled, id]);
+    return { success: true, enabled: !!newEnabled };
+  }
+
+  // Update last run time for a schedule
+  updateScheduleLastRun(id, lastRun) {
+    this.run("UPDATE schedules SET last_run = ? WHERE id = ?", [lastRun, id]);
+  }
+
+  // Get enabled schedules only
+  getEnabledSchedules() {
+    return this.query("SELECT * FROM schedules WHERE enabled = 1 ORDER BY time ASC");
+  }
+
+  // Export database and encryption key as a backup package (JSON)
+  exportBackup() {
+    // Save current state first
+    this.save();
+
+    // Read the database file
+    const dbData = fs.existsSync(this.dbPath)
+      ? fs.readFileSync(this.dbPath).toString('base64')
+      : null;
+
+    // Read the encryption key
+    const keyData = fs.existsSync(this.keyPath)
+      ? fs.readFileSync(this.keyPath, 'utf8')
+      : null;
+
+    // Create backup package
+    const backup = {
+      version: 1,
+      createdAt: new Date().toISOString(),
+      database: dbData,
+      encryptionKey: keyData,
+    };
+
+    return JSON.stringify(backup, null, 2);
+  }
+
+  // Import database and encryption key from a backup package
+  importBackup(backupJson) {
+    const backup = JSON.parse(backupJson);
+
+    if (!backup.database || !backup.encryptionKey) {
+      throw new Error('Invalid backup file: missing database or encryption key');
+    }
+
+    // Close current database
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
+
+    // Restore encryption key first
+    fs.writeFileSync(this.keyPath, backup.encryptionKey, { mode: 0o600 });
+    this.encryptionKey = backup.encryptionKey;
+
+    // Restore database file
+    const dbBuffer = Buffer.from(backup.database, 'base64');
+    fs.writeFileSync(this.dbPath, dbBuffer);
+
+    // Reload the database
+    this.db = new this.SQL.Database(dbBuffer);
+
+    return {
+      success: true,
+      createdAt: backup.createdAt,
+      version: backup.version
+    };
+  }
+
+  // Get paths for manual backup info
+  getDataPaths() {
+    return {
+      database: this.dbPath,
+      encryptionKey: this.keyPath,
+      userDataPath: this.userDataPath
+    };
   }
 
   close() {
