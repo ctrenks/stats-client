@@ -1,6 +1,6 @@
 {
   "name": "affiliate-stats-client",
-  "version": "1.8.0",
+  "version": "1.9.9",
   "description": "Stats Fetch - Desktop client for affiliate program statistics",
   "main": "src/main.js",
   "scripts": {
@@ -29,12 +29,12 @@
   "build": {
     "appId": "com.statsfetch.client",
     "productName": "Stats Fetch",
-    "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+    "artifactName": "StatsFetch-${version}-${os}-${arch}.${ext}",
     "publish": [
       {
         "provider": "github",
         "owner": "ctrenks",
-        "repo": "stats-client"
+        "repo": "statspull"
       }
     ],
     "directories": {
@@ -49,8 +49,11 @@
           ]
         }
       ],
-      "icon": "build/icon.png",
-      "signAndEditExecutable": false
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
     },
     "forceCodeSigning": false,
     "mac": {
@@ -71,9 +74,13 @@
         }
       ],
       "icon": "build/icon.png",
-      "identity": null,
-      "hardenedRuntime": false,
-      "gatekeeperAssess": false
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": {
+        "teamId": "3Y76JBLTM3"
+      }
     },
     "linux": {
       "target": "AppImage",
