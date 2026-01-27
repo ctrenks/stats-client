@@ -179,7 +179,11 @@ class SyncEngine {
     if (otherPrograms.length > 0) {
       // Get concurrency limit from settings (default: 5)
       const concurrencySetting = this.db.getSetting('syncConcurrency');
-      const CONCURRENCY_LIMIT = concurrencySetting ? parseInt(concurrencySetting) : 5;
+      this.log(`[DEBUG] Raw syncConcurrency setting: "${concurrencySetting}" (type: ${typeof concurrencySetting})`);
+      const parsedValue = concurrencySetting ? parseInt(concurrencySetting, 10) : 5;
+      // Ensure valid number between 1 and 20
+      const CONCURRENCY_LIMIT = (parsedValue >= 1 && parsedValue <= 20) ? parsedValue : 5;
+      this.log(`[DEBUG] Parsed concurrency: ${parsedValue}, using: ${CONCURRENCY_LIMIT}`);
       this.log(`Syncing ${otherPrograms.length} non-Rival programs (max ${CONCURRENCY_LIMIT} concurrent)...`);
 
       for (let i = 0; i < otherPrograms.length; i += CONCURRENCY_LIMIT) {
@@ -469,6 +473,7 @@ class SyncEngine {
       'RIVAL': this.syncRival,
       'CASINO_REWARDS': this.syncCasinoRewards,
       'NUMBER1AFFILIATES': this.syncNumber1Affiliates,
+      'MAP': this.syncMAP,
       'CUSTOM': this.syncCustom
     };
     return handlers[provider];
@@ -1160,7 +1165,8 @@ class SyncEngine {
       monthlyTotals[monthKey].signups += signups;
       monthlyTotals[monthKey].ftds += ftds;
       monthlyTotals[monthKey].deposits += deposits;
-      monthlyTotals[monthKey].revenue += revenue;
+      // Only add positive revenue - negative casino balances don't reduce total
+      monthlyTotals[monthKey].revenue += revenue > 0 ? revenue : 0;
     }
 
     // Add aggregated totals to stats array
@@ -1865,7 +1871,7 @@ class SyncEngine {
       throw new Error('Username and password required for Mexos');
     }
 
-    this.log('Mexos - logging in...');
+    this.log('Mexos - starting...');
 
     // Launch browser and create page
     await scr.launch();
@@ -1879,42 +1885,72 @@ class SyncEngine {
       await page.goto(baseUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await scr.delay(3000);
 
-      // Fill login form
-      const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[name="login"]', '#username', '#email', 'input[type="text"]', 'input[type="email"]'];
-      const passwordSelectors = ['input[name="password"]', '#password', 'input[type="password"]'];
+      // Check if already logged in (cookies loaded from previous session)
+      const currentUrl = page.url();
+      const urlPath = new URL(currentUrl).pathname.toLowerCase();
+      const urlHash = new URL(currentUrl).hash.toLowerCase();
 
-      for (const sel of usernameSelectors) {
-        try {
-          const exists = await page.$(sel);
-          if (exists) {
-            await page.type(sel, username);
-            this.log(`Mexos - filled username`);
-            break;
+      // Check for logged-in indicators: dashboard/statistics in URL or no login form present
+      let isAlreadyLoggedIn = urlPath.includes('/dashboard') ||
+                              urlPath.includes('/statistics') ||
+                              urlHash.includes('/dashboard') ||
+                              urlHash.includes('/statistics') ||
+                              urlHash.includes('/home');
+
+      // Also check if login form exists
+      if (!isAlreadyLoggedIn) {
+        const hasLoginForm = await page.$('input[type="password"]');
+        if (!hasLoginForm) {
+          // No password field = likely already logged in
+          const hasLogoutBtn = await page.$('a[href*="logout"], button[class*="logout"], .logout, [ng-click*="logout"]');
+          if (hasLogoutBtn) {
+            isAlreadyLoggedIn = true;
           }
-        } catch (e) { /* try next */ }
+        }
       }
 
-      for (const sel of passwordSelectors) {
-        try {
-          const exists = await page.$(sel);
-          if (exists) {
-            await page.type(sel, password);
-            this.log(`Mexos - filled password`);
-            break;
-          }
-        } catch (e) { /* try next */ }
-      }
+      if (isAlreadyLoggedIn) {
+        this.log(`Mexos - ✓ Already logged in via cookies, skipping login form`);
+      } else {
+        this.log('Mexos - logging in...');
 
-      // Submit login
-      const submitBtn = await page.$('button[type="submit"], input[type="submit"], .btn-primary, .login-btn');
-      if (submitBtn) {
-        await Promise.all([
-          submitBtn.click(),
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
-        ]);
-      }
+        // Fill login form
+        const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[name="login"]', '#username', '#email', 'input[type="text"]', 'input[type="email"]'];
+        const passwordSelectors = ['input[name="password"]', '#password', 'input[type="password"]'];
 
-      await scr.delay(4000);
+        for (const sel of usernameSelectors) {
+          try {
+            const exists = await page.$(sel);
+            if (exists) {
+              await page.type(sel, username);
+              this.log(`Mexos - filled username`);
+              break;
+            }
+          } catch (e) { /* try next */ }
+        }
+
+        for (const sel of passwordSelectors) {
+          try {
+            const exists = await page.$(sel);
+            if (exists) {
+              await page.type(sel, password);
+              this.log(`Mexos - filled password`);
+              break;
+            }
+          } catch (e) { /* try next */ }
+        }
+
+        // Submit login
+        const submitBtn = await page.$('button[type="submit"], input[type="submit"], .btn-primary, .login-btn');
+        if (submitBtn) {
+          await Promise.all([
+            submitBtn.click(),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {})
+          ]);
+        }
+
+        await scr.delay(4000);
+      }
 
       // Navigate to statistics page (Angular hash routing)
       const statsUrl = baseUrl.replace(/\/$/, '') + '/#/statistics';
@@ -2948,9 +2984,321 @@ class SyncEngine {
     }
   }
 
+  // MAP Affiliate Platform scraper
+  async syncMAP({ program, credentials, config, loginUrl, scraper }) {
+    const scr = scraper || this.scraper;
+    const login = loginUrl || config?.loginUrl;
+
+    if (!login) {
+      throw new Error('MAP requires a login URL');
+    }
+
+    this.log('Starting MAP scrape...');
+    await scr.launch();
+    const page = await scr.browser.newPage();
+
+    try {
+      // Step 1: Navigate to login
+      this.log(`Navigating to login: ${login}`);
+      await page.goto(login, { waitUntil: 'networkidle2', timeout: 60000 });
+      await scr.delay(2000);
+
+      // Step 2: Fill login form
+      const username = credentials.username;
+      const password = credentials.password;
+
+      if (!username || !password) {
+        throw new Error('Username and password required');
+      }
+
+      // Try common login selectors for MAP
+      const usernameSelectors = ['input[name="username"]', 'input[name="txtUser"]', '#txtUser', 'input[type="text"]', '#username'];
+      const passwordSelectors = ['input[name="password"]', 'input[name="txtPassword"]', '#txtPassword', 'input[type="password"]'];
+
+      let usernameField = null;
+      for (const sel of usernameSelectors) {
+        usernameField = await page.$(sel);
+        if (usernameField) break;
+      }
+
+      let passwordField = null;
+      for (const sel of passwordSelectors) {
+        passwordField = await page.$(sel);
+        if (passwordField) break;
+      }
+
+      if (usernameField && passwordField) {
+        await usernameField.type(username, { delay: 50 });
+        await passwordField.type(password, { delay: 50 });
+
+        // Check "Remember Me" checkbox if present
+        const rememberMe = await page.$('input[type="checkbox"][name*="remember"], input[type="checkbox"][id*="remember"], #RememberMe, .remember-me input');
+        if (rememberMe) {
+          const isChecked = await page.evaluate(el => el.checked, rememberMe);
+          if (!isChecked) {
+            await rememberMe.click();
+            this.log('Checked Remember Me');
+          }
+        }
+
+        // Find and click submit
+        const submitBtn = await page.$('button[type="submit"], input[type="submit"], #btnLogin, .btn-login');
+        if (submitBtn) {
+          await submitBtn.click();
+        } else {
+          await page.keyboard.press('Enter');
+        }
+
+        await scr.delay(3000);
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+      } else {
+        throw new Error('Could not find login form fields');
+      }
+
+      this.log('✓ Logged in');
+
+      // Step 3: Navigate to reports/activity page
+      const baseUrl = login.replace(/\/[^/]*$/, '').replace(/\/+$/, '');
+      const reportsUrl = `${baseUrl}/reportsactivity.aspx`;
+      this.log(`Navigating to reports: ${reportsUrl}`);
+      await page.goto(reportsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await scr.delay(2000);
+
+      // Step 4: Set up report filters (only once, before first search)
+      // Select "Monthly Report" (value=2) from Report Display Type
+      this.log('Selecting Monthly Report...');
+      await page.select('#ContentPlaceHolder1_ddltype', '2');
+      await scr.delay(1500); // Wait for ASP.NET postback
+
+      // Select "All Brands" (value=0)
+      this.log('Selecting All Brands...');
+      await page.select('#ContentPlaceHolder1_ddlBrand', '0');
+      await scr.delay(1000);
+
+      // Ensure "Include Clicks & Impressions" checkbox is checked
+      const clicksCheckbox = await page.$('#ContentPlaceHolder1_chkclicks');
+      if (clicksCheckbox) {
+        const isChecked = await page.evaluate(el => el.checked, clicksCheckbox);
+        if (!isChecked) {
+          this.log('Checking Include Clicks & Impressions...');
+          await clicksCheckbox.click();
+          await scr.delay(1000);
+        } else {
+          this.log('Include Clicks & Impressions already checked');
+        }
+      }
+
+      // Get exchange rates for currency conversion
+      const exchangeRates = await this.getExchangeRates();
+      this.log(`Loaded exchange rates: GBP=${exchangeRates.GBP}, EUR=${exchangeRates.EUR}`);
+
+      const allStats = [];
+
+      // Fetch both this month and last month
+      for (const period of ['thisMonth', 'lastMonth']) {
+        const dateValue = period === 'thisMonth' ? '4' : '5';
+        this.log(`Fetching ${period}...`);
+
+        // Select date range (This Month=4, Last Month=5)
+        await page.select('#ContentPlaceHolder1_ddlviewby', dateValue);
+        await scr.delay(1500); // Wait for ASP.NET postback
+
+        // Click search button
+        await page.click('#btnSearch');
+        await scr.delay(3000); // Wait for results to load
+
+        // Wait for table to update
+        await page.waitForSelector('#gvActivityreport tbody tr', { timeout: 10000 }).catch(() => {});
+        await scr.delay(1000);
+
+        // Parse the results table - get column headers first to find correct indices
+        const periodData = await page.evaluate(() => {
+          const table = document.querySelector('#gvActivityreport');
+          if (!table) return null;
+
+          // First, get the header row to find column indices dynamically
+          const headerRow = table.querySelector('thead tr');
+          const headers = [];
+          if (headerRow) {
+            headerRow.querySelectorAll('th').forEach((th, idx) => {
+              headers.push(th.textContent.trim().toLowerCase());
+            });
+          }
+
+          // Find column indices by header name
+          const findCol = (names) => {
+            for (const name of names) {
+              const idx = headers.findIndex(h => h.includes(name));
+              if (idx !== -1) return idx;
+            }
+            return -1;
+          };
+
+          const colBrand = findCol(['brand']);
+          const colImpressions = findCol(['impression']);
+          const colClicks = findCol(['clicks']);
+          const colReg = findCol(['registration', 'signup', 'reg']);
+          const colFTD = findCol(['ftd']);
+          const colCurrency = findCol(['currency']);
+          const colDeposit = findCol(['deposit']);
+          const colNetRevenue = findCol(['net revenue', 'netrevenue']);
+          const colRevCommission = findCol(['revenue commission', 'commission']);
+
+          const rows = table.querySelectorAll('tbody tr');
+          const data = {
+            impressions: 0,
+            clicks: 0,
+            signups: 0,
+            ftds: 0,
+            currencyData: [],
+            debug: { headers, colBrand, colClicks, colFTD, colCurrency, rowCount: rows.length }
+          };
+
+          rows.forEach(row => {
+            const cells = row.querySelectorAll('td');
+            if (cells.length >= 8) {
+              const brand = colBrand >= 0 ? cells[colBrand]?.textContent.trim() : '';
+              const impressions = colImpressions >= 0 ? parseInt(cells[colImpressions]?.textContent.replace(/[^0-9.-]/g, '')) || 0 : 0;
+              const clicks = colClicks >= 0 ? parseInt(cells[colClicks]?.textContent.replace(/[^0-9.-]/g, '')) || 0 : 0;
+              const signups = colReg >= 0 ? parseInt(cells[colReg]?.textContent.replace(/[^0-9.-]/g, '')) || 0 : 0;
+              const ftds = colFTD >= 0 ? parseInt(cells[colFTD]?.textContent.replace(/[^0-9.-]/g, '')) || 0 : 0;
+              const currencyText = colCurrency >= 0 ? cells[colCurrency]?.textContent.trim() : 'USD';
+              const deposits = colDeposit >= 0 ? parseFloat(cells[colDeposit]?.textContent.replace(/[^0-9.-]/g, '')) || 0 : 0;
+              const netRevenue = colNetRevenue >= 0 ? parseFloat(cells[colNetRevenue]?.textContent.replace(/[^0-9.-]/g, '')) || 0 : 0;
+              const commission = colRevCommission >= 0 ? parseFloat(cells[colRevCommission]?.textContent.replace(/[^0-9.-]/g, '')) || 0 : 0;
+
+              // Extract currency code from format like "GBP(£)" or "EUR(€)"
+              let currency = 'USD';
+              const currencyMatch = currencyText.match(/^([A-Z]{3})/);
+              if (currencyMatch) {
+                currency = currencyMatch[1];
+              }
+
+              data.impressions += impressions;
+              data.clicks += clicks;
+              data.signups += signups;
+              data.ftds += ftds;
+
+              // Store per-brand currency data for conversion
+              data.currencyData.push({
+                brand,
+                currency,
+                deposits,
+                revenue: commission || netRevenue,
+                clicks,
+                ftds
+              });
+            }
+          });
+
+          return data;
+        });
+
+        // Log debug info
+        if (periodData?.debug) {
+          this.log(`Table debug: ${periodData.debug.rowCount} rows, headers: ${periodData.debug.headers.join(', ')}`);
+          this.log(`Column indices: brand=${periodData.debug.colBrand}, clicks=${periodData.debug.colClicks}, ftd=${periodData.debug.colFTD}, currency=${periodData.debug.colCurrency}`);
+        }
+
+        if (periodData && periodData.currencyData.length > 0) {
+          // Convert all amounts to USD
+          let totalDepositsUSD = 0;
+          let totalRevenueUSD = 0;
+
+          for (const item of periodData.currencyData) {
+            const rate = exchangeRates[item.currency] || 1;
+            // Exchange rates are typically X per 1 USD, so we divide
+            const depositsUSD = item.deposits / rate;
+            const revenueUSD = item.revenue / rate;
+
+            this.log(`  ${item.brand}: clicks=${item.clicks}, ftds=${item.ftds}, ${item.currency} deposits=${item.deposits} -> USD ${depositsUSD.toFixed(2)}, revenue=${item.revenue} -> USD ${revenueUSD.toFixed(2)}`);
+
+            totalDepositsUSD += depositsUSD;
+            totalRevenueUSD += revenueUSD;
+          }
+
+          // Calculate date for this period
+          const now = new Date();
+          let statDate;
+          if (period === 'thisMonth') {
+            statDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+          } else {
+            const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 15);
+            statDate = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, '0')}-15`;
+          }
+
+          allStats.push({
+            date: statDate,
+            impressions: periodData.impressions,
+            clicks: periodData.clicks,
+            signups: periodData.signups,
+            ftds: periodData.ftds,
+            deposits: Math.round(totalDepositsUSD * 100), // Convert to cents
+            revenue: Math.round(totalRevenueUSD * 100)
+          });
+
+          this.log(`${period}: clicks=${periodData.clicks}, signups=${periodData.signups}, ftds=${periodData.ftds}, deposits=$${totalDepositsUSD.toFixed(2)}, revenue=$${totalRevenueUSD.toFixed(2)}`);
+        } else {
+          this.log(`No data found for ${period}`);
+        }
+      }
+
+      await page.close();
+
+      this.log(`✓ MAP sync complete: ${allStats.length} month(s)`);
+      return allStats;
+
+    } catch (error) {
+      this.log(`MAP error: ${error.message}`, 'error');
+      await page.close();
+      throw error;
+    }
+  }
+
+  // Get exchange rates from API (cached for 1 hour)
+  async getExchangeRates() {
+    // Check cache
+    if (this._exchangeRates && this._exchangeRatesTime && (Date.now() - this._exchangeRatesTime) < 3600000) {
+      return this._exchangeRates;
+    }
+
+    try {
+      // Use frankfurter.app - free, no API key required
+      const response = await this.httpRequest('https://api.frankfurter.app/latest?from=USD');
+      if (response.data && response.data.rates) {
+        this._exchangeRates = response.data.rates;
+        // Add USD as 1
+        this._exchangeRates.USD = 1;
+        this._exchangeRatesTime = Date.now();
+        this.log(`Fetched exchange rates from API`);
+        return this._exchangeRates;
+      }
+    } catch (error) {
+      this.log(`Exchange rate API error: ${error.message}, using fallback rates`);
+    }
+
+    // Fallback rates (approximate)
+    this._exchangeRates = {
+      USD: 1,
+      EUR: 0.92,
+      GBP: 0.79,
+      CAD: 1.36,
+      AUD: 1.53,
+      CHF: 0.88,
+      SEK: 10.5,
+      NOK: 10.8,
+      DKK: 6.9,
+      NZD: 1.65
+    };
+    this._exchangeRatesTime = Date.now();
+    return this._exchangeRates;
+  }
+
   async syncCustom({ program, credentials, config }) {
     throw new Error('Custom providers require manual configuration');
   }
 }
+
+module.exports = SyncEngine;
 
 module.exports = SyncEngine;

@@ -84,7 +84,12 @@ const LICENSE_CHECK_INTERVAL = 24 * 60 * 60 * 1000;
 let licenseCheckTimer = null;
 let schedulerInterval = null;
 
-// Configure auto-updater
+// Configure auto-updater - explicitly set GitHub repo to ensure correct update source
+autoUpdater.setFeedURL({
+  provider: 'github',
+  owner: 'ctrenks',
+  repo: 'statspull'
+});
 autoUpdater.autoDownload = false; // Don't auto-download, ask user first
 autoUpdater.autoInstallOnAppQuit = true; // Install update when app quits
 autoUpdater.logger = {
@@ -118,16 +123,23 @@ autoUpdater.on('update-not-available', (info) => {
 });
 
 autoUpdater.on('error', (err) => {
-  // Only log errors, don't show them to user (to avoid rate limit errors from update server)
   console.error('[AUTO-UPDATER] Error:', err.message);
-  // Don't send error to UI - updates are optional
+  console.error('[AUTO-UPDATER] Full error:', err);
+  // Show error to user so they know the download failed
+  sendUpdateStatus('error', `Update failed: ${err.message}`, { error: err.message });
 });
 
 autoUpdater.on('download-progress', (progressObj) => {
-  sendUpdateStatus('downloading', `Downloading update: ${Math.round(progressObj.percent)}%`, progressObj);
+  const percent = Math.round(progressObj.percent);
+  const speed = progressObj.bytesPerSecond ? `${Math.round(progressObj.bytesPerSecond / 1024)} KB/s` : '';
+  const transferred = progressObj.transferred ? `${Math.round(progressObj.transferred / 1024 / 1024)} MB` : '';
+  const total = progressObj.total ? `${Math.round(progressObj.total / 1024 / 1024)} MB` : '';
+  console.log(`[AUTO-UPDATER] Download progress: ${percent}% (${transferred}/${total}) ${speed}`);
+  sendUpdateStatus('downloading', `Downloading: ${percent}% ${speed ? `(${speed})` : ''}`, progressObj);
 });
 
 autoUpdater.on('update-downloaded', (info) => {
+  console.log(`[AUTO-UPDATER] Update downloaded: v${info.version}`);
   sendUpdateStatus('downloaded', `Update v${info.version} downloaded - restart to install`, info);
 });
 
