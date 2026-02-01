@@ -71,6 +71,193 @@ class Scraper {
     }
   }
 
+  // Month name to number mapping (0-indexed like JavaScript Date)
+  static MONTH_MAP = {
+    'january': 0, 'jan': 0,
+    'february': 1, 'feb': 1,
+    'march': 2, 'mar': 2,
+    'april': 3, 'apr': 3,
+    'may': 4,
+    'june': 5, 'jun': 5,
+    'july': 6, 'jul': 6,
+    'august': 7, 'aug': 7,
+    'september': 8, 'sep': 8, 'sept': 8,
+    'october': 9, 'oct': 9,
+    'november': 10, 'nov': 10,
+    'december': 11, 'dec': 11
+  };
+
+  /**
+   * Detect the displayed month/date from the platform page
+   * Searches for date patterns in headers, date pickers, and visible text
+   * Returns { year, month, dateStr } or null if not detected
+   * 
+   * @param {Page} page - Puppeteer page object
+   * @param {string} context - Context for logging (e.g., "header", "date picker")
+   * @returns {Promise<{year: number, month: number, dateStr: string}|null>}
+   */
+  async detectDisplayedMonth(page, context = 'page') {
+    this.log(`Detecting displayed month from ${context}...`);
+
+    const result = await page.evaluate((monthMap) => {
+      // Helper to parse month name to number
+      const parseMonthName = (text) => {
+        const lower = text.toLowerCase();
+        for (const [name, num] of Object.entries(monthMap)) {
+          if (lower.includes(name)) {
+            return num;
+          }
+        }
+        return -1;
+      };
+
+      // Common patterns to look for displayed dates
+      const patterns = [
+        // "January 2026", "Jan 2026"
+        /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{4})\b/gi,
+        // "Stats for January 2026", "Report for Feb 2026"
+        /(?:stats|report|data|earnings|commission).*?\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+(\d{4})\b/gi,
+        // "01/2026", "1/2026", "2026-01", "2026/01"
+        /\b(\d{4})[-\/](\d{1,2})\b|\b(\d{1,2})[-\/](\d{4})\b/g,
+        // Date range like "Jan 1, 2026 - Jan 31, 2026"
+        /\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\s+\d{1,2},?\s+(\d{4})/gi
+      ];
+
+      // Selectors to check for date information (ordered by priority)
+      const dateSelectors = [
+        // Headers and titles
+        'h1', 'h2', 'h3', '.page-title', '.header-title', '#controlHeader_middle',
+        // Date pickers and inputs
+        '.daterangepicker .drp-selected', '.date-range', '.drp-selected',
+        'input[type="date"]', 'input[name*="date"]', 'input[id*="date"]',
+        'select[name*="month"]', 'select[id*="month"]',
+        // Common dashboard elements
+        '.stats-period', '.report-period', '.date-display', '.period-display',
+        '[class*="date"]', '[class*="period"]', '[class*="month"]',
+        // Dropdown triggers
+        '.dropdown-toggle', '.select-display'
+      ];
+
+      let bestMatch = null;
+
+      // First, check specific date-related elements
+      for (const selector of dateSelectors) {
+        const elements = document.querySelectorAll(selector);
+        for (const el of elements) {
+          const text = el.innerText || el.value || '';
+          if (!text) continue;
+
+          // Try month name patterns first
+          for (const pattern of patterns) {
+            const regex = new RegExp(pattern.source, pattern.flags);
+            const match = regex.exec(text);
+            if (match) {
+              // Parse the match
+              if (match[1] && match[2]) {
+                const monthNum = parseMonthName(match[1]);
+                const year = parseInt(match[2]);
+                if (monthNum >= 0 && year >= 2000 && year <= 2100) {
+                  console.log(`Found date in ${selector}: ${match[0]} -> ${year}-${monthNum + 1}`);
+                  return { year, month: monthNum, source: selector, text: match[0] };
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // If no specific elements found, search the whole page body
+      const bodyText = document.body?.innerText || '';
+      const lines = bodyText.split('\n').slice(0, 50); // Check first 50 lines
+
+      for (const line of lines) {
+        for (const pattern of patterns) {
+          const regex = new RegExp(pattern.source, pattern.flags);
+          const match = regex.exec(line);
+          if (match) {
+            if (match[1] && match[2]) {
+              const monthNum = parseMonthName(match[1]);
+              const year = parseInt(match[2]);
+              if (monthNum >= 0 && year >= 2000 && year <= 2100) {
+                console.log(`Found date in body: ${match[0]} -> ${year}-${monthNum + 1}`);
+                return { year, month: monthNum, source: 'body', text: match[0] };
+              }
+            }
+          }
+        }
+      }
+
+      return null;
+    }, Scraper.MONTH_MAP);
+
+    if (result) {
+      const dateStr = `${result.year}-${String(result.month + 1).padStart(2, '0')}-01`;
+      this.log(`✓ Detected month from ${context}: ${result.text} -> ${dateStr} (source: ${result.source})`);
+      return { year: result.year, month: result.month, dateStr };
+    }
+
+    this.log(`⚠ Could not detect month from ${context}, will use system date as fallback`, 'warn');
+    return null;
+  }
+
+  /**
+   * Get the date to use for stats, preferring platform-detected date over system date
+   * Returns { year, month, dateStr } with dateStr in YYYY-MM-DD format (first of month)
+   * 
+   * @param {Page} page - Puppeteer page object
+   * @param {string} context - Context for logging
+   * @returns {Promise<{year: number, month: number, dateStr: string}>}
+   */
+  async getStatsMonth(page, context = 'page') {
+    // Try to detect from platform first
+    const detected = await this.detectDisplayedMonth(page, context);
+    if (detected) {
+      return detected;
+    }
+
+    // Fallback to system date
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = now.getMonth();
+    const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-01`;
+    this.log(`Using system date as fallback: ${dateStr}`);
+    return { year, month, dateStr };
+  }
+
+  /**
+   * Parse a date string into { year, month } - handles various formats
+   * @param {string} dateStr - Date string to parse
+   * @returns {{year: number, month: number}|null}
+   */
+  parseMonthFromString(dateStr) {
+    if (!dateStr) return null;
+
+    const lower = dateStr.toLowerCase();
+
+    // Try month name patterns
+    for (const [monthName, monthNum] of Object.entries(Scraper.MONTH_MAP)) {
+      if (lower.includes(monthName)) {
+        const yearMatch = dateStr.match(/(\d{4})/);
+        if (yearMatch) {
+          return { year: parseInt(yearMatch[1]), month: monthNum };
+        }
+      }
+    }
+
+    // Try YYYY-MM or MM/YYYY patterns
+    const ymdMatch = dateStr.match(/(\d{4})[-\/](\d{1,2})/);
+    if (ymdMatch) {
+      return { year: parseInt(ymdMatch[1]), month: parseInt(ymdMatch[2]) - 1 };
+    }
+
+    const mdyMatch = dateStr.match(/(\d{1,2})[-\/](\d{4})/);
+    if (mdyMatch) {
+      return { year: parseInt(mdyMatch[2]), month: parseInt(mdyMatch[1]) - 1 };
+    }
+
+    return null;
+  }
+
   // Get Chromium path from Electron
   getChromiumPath() {
     // In packaged app, use Electron's Chromium
@@ -1380,10 +1567,11 @@ class Scraper {
       // Clear any table row entries - summary is more reliable
       stats.length = 0;
 
-      const today = new Date().toISOString().split('T')[0];
+      // Use the startDate parameter (which comes from the platform's date range) instead of system date
+      const dateStr = startDate ? this.formatDate(startDate) : new Date().toISOString().split('T')[0];
       const summary = rawStats.summary;
 
-      this.log(`Creating stats entry for ${today} from summary data`);
+      this.log(`Creating stats entry for ${dateStr} from summary data`);
       this.log(`Raw summary: ${JSON.stringify(summary)}`);
 
       // Calculate FTDs from percentage if available
@@ -1399,7 +1587,7 @@ class Scraper {
         : Math.round(summary.deposits || 0);  // Keep as count
 
       const entry = {
-        date: today,
+        date: dateStr,
         clicks: Math.round(summary.clicks || 0),
         impressions: Math.round(summary.impressions || 0),
         signups: Math.round(summary.signups || summary.registrations || 0),
@@ -1749,10 +1937,9 @@ class Scraper {
 
       const allStats = [];
 
-      // Save THIS MONTH stats (use current month's first day as date)
-      const now = new Date();
-      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-      const currentDateStr = currentMonthStart.toISOString().split('T')[0];
+      // Detect the displayed month from the platform (not local system date)
+      const detectedMonth = await this.getStatsMonth(page, 'MyAffiliates homepage');
+      const currentDateStr = detectedMonth.dateStr;
 
       allStats.push({
         date: currentDateStr,
@@ -1843,8 +2030,9 @@ class Scraper {
           // (User said this is OK - we already have it from the funnel page which shows historical data)
           const lastMonthFtd = combined.ftds; // From funnel page
 
-          const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
-          const lastMonthDateStr = lastMonthEnd.toISOString().split('T')[0];
+          // Calculate last month based on the detected current month (not system date)
+          const lastMonthDate = new Date(detectedMonth.year, detectedMonth.month - 1, 1);
+          const lastMonthDateStr = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}-01`;
 
           allStats.push({
             date: lastMonthDateStr,
@@ -2015,14 +2203,14 @@ class Scraper {
 
       this.log(`Found ${stats.tableRows.length} table rows and widget data: ${JSON.stringify(stats.widgets)}`);
 
-      // Parse the stats
-      const today = new Date().toISOString().split('T')[0];
+      // Detect the displayed month from the platform (not local system date)
+      const detectedMonth = await this.getStatsMonth(page, 'Affilka dashboard');
       const parsedStats = [];
 
       // If we have widget data, use it
       if (Object.keys(stats.widgets).length > 0) {
         parsedStats.push({
-          date: today,
+          date: detectedMonth.dateStr,
           clicks: parseInt((stats.widgets.clicks || '0').replace(/[^0-9]/g, '')) || 0,
           impressions: 0,
           signups: parseInt((stats.widgets.signups || '0').replace(/[^0-9]/g, '')) || 0,
@@ -2040,7 +2228,7 @@ class Scraper {
           const numbers = row.slice(1).map(v => parseFloat(v.replace(/[^0-9.-]/g, ''))).filter(n => !isNaN(n));
           if (numbers.length >= 2) {
             parsedStats.push({
-              date: this.parseDate(row[0]) || today,
+              date: this.parseDate(row[0]) || detectedMonth.dateStr,
               clicks: numbers[0] || 0,
               impressions: 0,
               signups: numbers[1] || 0,
@@ -2053,9 +2241,9 @@ class Scraper {
       }
 
       if (parsedStats.length === 0) {
-        // Return empty stats for today if nothing found
+        // Return empty stats for detected month if nothing found
         parsedStats.push({
-          date: today,
+          date: detectedMonth.dateStr,
           clicks: 0,
           impressions: 0,
           signups: 0,
@@ -2267,12 +2455,12 @@ class Scraper {
       await this.delay(2000);
       await page.waitForSelector('body', { timeout: 10000 }).catch(() => {});
 
-      // Get current month date (first day)
-      const now = new Date();
-      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-
-      // Get last month's last day (for proper date storage)
-      const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+      // Detect the displayed month from the platform (not local system date)
+      const detectedMonth = await this.getStatsMonth(page, 'Generic platform');
+      
+      // Calculate last month based on detected month
+      const lastMonthDate = new Date(detectedMonth.year, detectedMonth.month - 1, 1);
+      const lastMonthDateStr = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}-01`;
 
       const allStats = [];
 
@@ -2320,9 +2508,8 @@ class Scraper {
           const thisMonthStats = await this.extractPageStats(page);
           this.log(`This Month: clicks=${thisMonthStats.clicks}, signups=${thisMonthStats.signups}, ftds=${thisMonthStats.ftds}, deposits=${thisMonthStats.deposits}, commission=${thisMonthStats.revenue}`);
 
-          const currentDateStr = currentMonthStart.toISOString().split('T')[0];
           allStats.push({
-            date: currentDateStr,
+            date: detectedMonth.dateStr,
             clicks: Math.round(thisMonthStats.clicks || 0),
             impressions: 0,
             signups: Math.round(thisMonthStats.signups || 0),
@@ -2354,12 +2541,14 @@ class Scraper {
         const dateRange = lastMonthResult.dateRange;
         this.log(`"Last Month" button result: ${dateRange}`);
 
+        // Try to detect the month from the displayed date range
+        const parsedRange = this.parseMonthFromString(dateRange);
+        
         // Check if "Last Month" is actually showing the current month (their date picker bug at month-end)
-        const now = new Date();
-        const currentMonthName = now.toLocaleString('en-US', { month: 'short' });
+        const isCurrentMonth = parsedRange && parsedRange.month === detectedMonth.month && parsedRange.year === detectedMonth.year;
 
-        if (dateRange.startsWith(currentMonthName)) {
-          this.log(`✓ "Last Month" button shows ${currentMonthName} (actually THIS month's full range)`, 'info');
+        if (isCurrentMonth) {
+          this.log(`✓ "Last Month" button shows ${dateRange} (actually THIS month's full range)`, 'info');
           this.log('Using this as THIS month data (workaround for their date picker bug)', 'info');
 
           // This is actually THIS month data
@@ -2369,9 +2558,8 @@ class Scraper {
           this.log(`This Month (full): clicks=${actualThisMonthStats.clicks}, signups=${actualThisMonthStats.signups}, ftds=${actualThisMonthStats.ftds}, deposits=${actualThisMonthStats.deposits}, commission=${actualThisMonthStats.revenue}`);
 
           // Save as current month (or replace if we already saved bad data)
-          const currentDateStr = currentMonthStart.toISOString().split('T')[0];
           const thisMonthStat = {
-            date: currentDateStr,
+            date: detectedMonth.dateStr,
             clicks: Math.round(actualThisMonthStats.clicks || 0),
             impressions: 0,
             signups: Math.round(actualThisMonthStats.signups || 0),
@@ -2381,20 +2569,22 @@ class Scraper {
           };
 
           // If we already have a stat for this month, replace it; otherwise add it
-          if (allStats.length > 0 && allStats[allStats.length - 1].date === currentDateStr) {
+          if (allStats.length > 0 && allStats[allStats.length - 1].date === detectedMonth.dateStr) {
             allStats[allStats.length - 1] = thisMonthStat;
           } else {
             allStats.push(thisMonthStat);
           }
         } else {
-          // Actually last month (November or earlier)
+          // Actually last month
           await this.delay(3000);
 
           const lastMonthStats = await this.extractPageStats(page);
           this.log(`Last Month (actual): clicks=${lastMonthStats.clicks}, signups=${lastMonthStats.signups}, ftds=${lastMonthStats.ftds}, deposits=${lastMonthStats.deposits}, commission=${lastMonthStats.revenue}`);
 
-          // Save with last day of previous month
-          const lastDateStr = lastMonthEnd.toISOString().split('T')[0];
+          // Use the parsed date range or fall back to calculated last month
+          const actualLastMonth = parsedRange || { year: lastMonthDate.getFullYear(), month: lastMonthDate.getMonth() };
+          const lastDateStr = `${actualLastMonth.year}-${String(actualLastMonth.month + 1).padStart(2, '0')}-01`;
+          
           allStats.push({
             date: lastDateStr,
             clicks: Math.round(lastMonthStats.clicks || 0),
@@ -3622,9 +3812,12 @@ class Scraper {
         this.log('⚠️ No table found on page, may not be on dashboard', 'warn');
       }
 
-      // Get current month dates
-      const now = new Date();
-      const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      // Detect the displayed month from the platform (not local system date)
+      const detectedMonth = await this.getStatsMonth(page, 'NetRefer dashboard');
+      
+      // Calculate last month based on detected month
+      const lastMonthDate = new Date(detectedMonth.year, detectedMonth.month - 1, 1);
+      const lastMonthDateStr = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}-01`;
 
       const allStats = [];
 
@@ -3802,9 +3995,8 @@ class Scraper {
       this.log(`Last Month: clicks=${tableStats.results.lastMonth.clicks}, signups=${tableStats.results.lastMonth.signups}, ftds=${tableStats.results.lastMonth.ftds}, deposits=${tableStats.results.lastMonth.deposits}, revenue=${tableStats.results.lastMonth.revenue}`);
 
       // Save This Month data
-      const currentDateStr = currentMonthStart.toISOString().split('T')[0];
       allStats.push({
-        date: currentDateStr,
+        date: detectedMonth.dateStr,
         clicks: Math.round(tableStats.results.thisMonth.clicks || 0),
         impressions: 0,
         signups: Math.round(tableStats.results.thisMonth.signups || 0),
@@ -3813,11 +4005,9 @@ class Scraper {
         revenue: Math.round((tableStats.results.thisMonth.revenue || 0) * 100)
       });
 
-      // Save Last Month data (use last day of previous month)
-      const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
-      const lastDateStr = lastMonthEnd.toISOString().split('T')[0];
+      // Save Last Month data
       allStats.push({
-        date: lastDateStr,
+        date: lastMonthDateStr,
         clicks: Math.round(tableStats.results.lastMonth.clicks || 0),
         impressions: 0,
         signups: Math.round(tableStats.results.lastMonth.signups || 0),
@@ -4201,12 +4391,12 @@ class Scraper {
 
       this.log(`This month stats: clicks=${thisMonthStats.clicks}, signups=${thisMonthStats.signups}, ftds=${ftds}, revenue=${thisMonthStats.revenue/100}, convRate=${thisMonthStats.conversionRate}%`);
 
-      const allStats = [];
-      const now = new Date();
-      const thisMonthDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+      // Detect the displayed month from the platform (not local system date)
+      const detectedMonth = await this.getStatsMonth(page, 'Deckmedia dashboard');
 
+      const allStats = [];
       allStats.push({
-        date: thisMonthDate,
+        date: detectedMonth.dateStr,
         clicks: thisMonthStats.clicks || 0,
         impressions: 0,
         signups: thisMonthStats.signups || 0,
@@ -4245,11 +4435,12 @@ class Scraper {
 
           this.log(`Last month stats: clicks=${lastMonthStats.clicks}, signups=${lastMonthStats.signups}, ftds=${lastMonthFtds}, revenue=${lastMonthStats.revenue/100}, convRate=${lastMonthStats.conversionRate}%`);
 
-          const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-          const lastMonthDate = `${lastMonth.getFullYear()}-${String(lastMonth.getMonth() + 1).padStart(2, '0')}-01`;
+          // Calculate last month based on detected month
+          const lastMonthCalc = new Date(detectedMonth.year, detectedMonth.month - 1, 1);
+          const lastMonthDateStr = `${lastMonthCalc.getFullYear()}-${String(lastMonthCalc.getMonth() + 1).padStart(2, '0')}-01`;
 
           allStats.push({
-            date: lastMonthDate,
+            date: lastMonthDateStr,
             clicks: lastMonthStats.clicks || 0,
             impressions: 0,
             signups: lastMonthStats.signups || 0,
@@ -4677,10 +4868,10 @@ class Scraper {
 
       if (!statsLinkClicked.found) {
         this.log('⚠️ Could not find "Statistics by Casino" link, returning earnings only', 'warn');
-        const now = new Date();
-        const thisMonthDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        // Detect month from platform or use fallback
+        const detectedMonth = await this.getStatsMonth(earningsPage, 'RTG earnings page');
         return [{
-          date: thisMonthDate.toISOString().split('T')[0],
+          date: detectedMonth.dateStr,
           clicks: 0,
           impressions: 0,
           signups: 0,
@@ -4712,10 +4903,10 @@ class Scraper {
 
       if (!statsPopup) {
         this.log('⚠️ Statistics window did not open, returning earnings only', 'warn');
-        const now = new Date();
-        const thisMonthDate = new Date(now.getFullYear(), now.getMonth(), 1);
+        // Detect month from platform or use fallback
+        const detectedMonth = await this.getStatsMonth(earningsPage, 'RTG earnings page');
         return [{
-          date: thisMonthDate.toISOString().split('T')[0],
+          date: detectedMonth.dateStr,
           clicks: 0,
           impressions: 0,
           signups: 0,
@@ -4772,10 +4963,21 @@ class Scraper {
     const { useDwcCalculation = false, revsharePercent = 0 } = dwcConfig;
     const allStats = [];
 
-    // Get current month dates
-    const now = new Date();
-    const thisMonthDate = new Date(now.getFullYear(), now.getMonth(), 1);
-    const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    // Detect the displayed month from the platform (not local system date)
+    const detectedMonth = await this.detectDisplayedMonth(contentFrame, 'RTG stats page');
+    
+    let thisMonthDateStr, lastMonthDateStr;
+    if (detectedMonth) {
+      thisMonthDateStr = detectedMonth.dateStr;
+      const lastMonthDate = new Date(detectedMonth.year, detectedMonth.month - 1, 1);
+      lastMonthDateStr = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}-01`;
+    } else {
+      // Fallback to system date
+      const now = new Date();
+      thisMonthDateStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+      const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      lastMonthDateStr = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}-01`;
+    }
 
     this.log(`Extracting stats from statistics page (revenue from earnings: $${revenue})...`);
 
@@ -4965,7 +5167,7 @@ class Scraper {
     }
 
     allStats.push({
-      date: thisMonthDate.toISOString().split('T')[0],
+      date: thisMonthDateStr,
       clicks: currentMonthStats.clicks,
       impressions: 0,
       signups: currentMonthStats.signups,
@@ -5126,7 +5328,7 @@ class Scraper {
       }
 
       allStats.push({
-        date: lastMonthDate.toISOString().split('T')[0],
+        date: lastMonthDateStr,
         clicks: lastMonthStats.clicks,
         impressions: 0,
         signups: lastMonthStats.signups,
@@ -5482,12 +5684,12 @@ class Scraper {
 
       const allStats = [];
 
-      // Get current date to determine which months to fetch
-      const today = new Date();
-      const currentMonth = today.getMonth(); // 0-11 (0=Jan, 11=Dec)
-      const currentYear = today.getFullYear();
+      // Detect the displayed month from the platform (not local system date)
+      const detectedMonth = await this.getStatsMonth(page, 'Rival reports page');
+      const currentMonth = detectedMonth.month; // 0-11 (0=Jan, 11=Dec)
+      const currentYear = detectedMonth.year;
 
-      // Calculate last month
+      // Calculate last month based on detected month
       const lastMonth = currentMonth === 0 ? 11 : currentMonth - 1;
       const lastMonthYear = currentMonth === 0 ? currentYear - 1 : currentYear;
 
@@ -5501,9 +5703,8 @@ class Scraper {
       const thisMonthStats = await this.extractRivalMonthStatsByDate(page, currentYear, currentMonth + 1, true);
 
       if (thisMonthStats) {
-        const thisMonthDate = new Date(currentYear, currentMonth, 1);
         allStats.push({
-          date: thisMonthDate.toISOString().split('T')[0],
+          date: detectedMonth.dateStr,
           clicks: thisMonthStats.clicks,
           impressions: thisMonthStats.impressions || 0,
           signups: thisMonthStats.signups,
@@ -5525,9 +5726,9 @@ class Scraper {
       const lastMonthStats = await this.extractRivalMonthStatsByDate(page, lastMonthYear, lastMonthFormValue, false);
 
       if (lastMonthStats) {
-        const lastMonthDate = new Date(lastMonthYear, lastMonth, 1);
+        const lastMonthDateStr = `${lastMonthYear}-${String(lastMonth + 1).padStart(2, '0')}-01`;
         allStats.push({
-          date: lastMonthDate.toISOString().split('T')[0],
+          date: lastMonthDateStr,
           clicks: lastMonthStats.clicks,
           impressions: lastMonthStats.impressions || 0,
           signups: lastMonthStats.signups,
@@ -6275,9 +6476,10 @@ class Scraper {
 
       // Get current month stats
       const currentStats = await extractMonthlyStats();
-      const today = new Date();
-      const currentYear = today.getFullYear();
-      const currentMonth = today.getMonth();
+      
+      // Use pageMonth (detected from platform) instead of system date
+      const currentYear = pageMonth ? pageMonth.year : new Date().getFullYear();
+      const currentMonth = pageMonth ? pageMonth.month : new Date().getMonth();
 
       const monthlyStats = {};
 
@@ -6289,8 +6491,8 @@ class Scraper {
 
       // Try to get last month's stats using date picker
       this.log('Attempting to get last month stats...');
-      const lastMonthDate = new Date(currentYear, currentMonth - 1, 1);
-      const lastMonthKey = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}`;
+      const lastMonthCalc = new Date(currentYear, currentMonth - 1, 1);
+      const lastMonthKey = `${lastMonthCalc.getFullYear()}-${String(lastMonthCalc.getMonth() + 1).padStart(2, '0')}`;
 
       // Look for a date picker/dropdown to change month
       const changedMonth = await page.evaluate((targetMonth, targetYear) => {
