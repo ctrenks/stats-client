@@ -291,10 +291,9 @@ class SyncEngine {
     if (statsUploadEnabled === 'true') {
       this.log('📤 Stats upload enabled - preparing data for web dashboard...');
 
-      // Gather monthly stats for all programs that synced successfully
+      // Gather ALL monthly stats for all programs that synced successfully
+      // This ensures historical data is preserved even after month rollovers
       const statsToUpload = [];
-      const now = new Date();
-      const currentMonth = now.toISOString().slice(0, 7); // YYYY-MM
 
       for (const result of results) {
         if (result.success) {
@@ -302,34 +301,29 @@ class SyncEngine {
           const program = programs.find(p => p.name === result.program);
           if (!program) continue;
 
-          // Get current month stats for this program
-          const startDate = `${currentMonth}-01`;
-          const endDate = now.toISOString().split('T')[0];
-          const stats = this.db.getStats(program.id, startDate, endDate);
+          // Get ALL monthly stats for this program (aggregated by month)
+          const monthlyStats = this.db.getMonthlyStats(program.id);
 
-          // Aggregate stats for the month
-          const monthStats = stats.reduce((acc, s) => ({
-            clicks: acc.clicks + (s.clicks || 0),
-            impressions: acc.impressions + (s.impressions || 0),
-            signups: acc.signups + (s.signups || 0),
-            ftds: acc.ftds + (s.ftds || 0),
-            deposits: acc.deposits + (s.deposits || 0),
-            revenue: acc.revenue + (s.revenue || 0),
-          }), { clicks: 0, impressions: 0, signups: 0, ftds: 0, deposits: 0, revenue: 0 });
-
-          statsToUpload.push({
-            programName: program.name,
-            programCode: program.code,
-            month: currentMonth,
-            currency: program.currency || 'USD',
-            ...monthStats
-          });
+          for (const monthData of monthlyStats) {
+            statsToUpload.push({
+              programName: program.name,
+              programCode: program.code,
+              month: monthData.month,
+              currency: program.currency || 'USD',
+              clicks: monthData.clicks || 0,
+              impressions: monthData.impressions || 0,
+              signups: monthData.signups || 0,
+              ftds: monthData.ftds || 0,
+              deposits: monthData.deposits || 0,
+              revenue: monthData.revenue || 0,
+            });
+          }
         }
       }
 
       // Store for upload by main process (can't do HTTP from here directly)
       this.pendingStatsUpload = statsToUpload;
-      this.log(`📊 Prepared ${statsToUpload.length} programs for stats upload`);
+      this.log(`📊 Prepared ${statsToUpload.length} month records across all programs for stats upload`);
     }
 
     return { success: true, synced, failed, results, pendingStatsUpload: this.pendingStatsUpload };

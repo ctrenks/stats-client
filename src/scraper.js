@@ -4116,8 +4116,13 @@ class Scraper {
           // Helper to parse value (removes $, commas, etc)
           const parseVal = (text) => {
             if (!text) return 0;
-            const cleaned = text.replace(/[$€£,\s]/g, '').trim();
-            return parseFloat(cleaned) || 0;
+            text = text.toString().trim();
+            // Check for accounting notation: (xxx) means negative
+            const isNegative = text.startsWith('(') && text.endsWith(')');
+            const cleaned = text.replace(/[$€£,\s()]/g, '').trim();
+            const num = parseFloat(cleaned);
+            if (isNaN(num)) return 0;
+            return isNegative ? -num : num;
           };
 
           // Try specific RTG dashboard IDs first
@@ -4599,22 +4604,28 @@ class Scraper {
         revenueData = await earningsPopup.evaluate(() => {
         const parseNum = (text) => {
           if (!text) return 0;
-          text = text.toString().replace(/[$,]/g, '').trim();
+          text = text.toString().trim();
+          // Check for accounting notation: (xxx) means negative
+          const isNegative = text.startsWith('(') && text.endsWith(')');
+          // Remove $, commas, parentheses, and trim
+          text = text.replace(/[$,()]/g, '').trim();
           const num = parseFloat(text);
-          return isNaN(num) ? 0 : num;
+          if (isNaN(num)) return 0;
+          return isNegative ? -num : num;
         };
 
         // Extract revenue from earnings page
         const bodyText = document.body.textContent;
 
-        // Fallback: look for any dollar amount
-        const numbers = bodyText.match(/\$\s?[\d,]+\.?\d*/g) || [];
+        // Look for dollar amounts - including accounting notation ($ xxx.xx) for negatives
+        // Match: $123.45, ($ 123.45), ($123.45), -$123.45
+        const numbers = bodyText.match(/\(?\$\s?[\d,]+\.?\d*\)?|\(-?\s?\$\s?[\d,]+\.?\d*\s?\)/g) || [];
 
-        // Filter out $0.00 and find first positive amount
+        // Find first non-zero amount (could be negative in accounting notation)
         let revenue = 0;
         for (const num of numbers) {
           const parsed = parseNum(num);
-          if (parsed > 0) {
+          if (parsed !== 0) {
             revenue = parsed;
             break;
           }
@@ -4800,12 +4811,16 @@ class Scraper {
     const currentMonthStats = await contentFrame.evaluate(() => {
       const parseNum = (text) => {
         if (!text) return 0;
-        // Remove $, commas, parentheses (for negative), and trim
-        text = text.toString().replace(/[$,()]/g, '').trim();
+        text = text.toString().trim();
         // Skip percentage values
         if (text.includes('%')) return 0;
+        // Check for accounting notation: (xxx) means negative
+        const isNegative = text.startsWith('(') && text.endsWith(')');
+        // Remove $, commas, parentheses, and trim
+        text = text.replace(/[$,()]/g, '').trim();
         const num = parseFloat(text);
-        return isNaN(num) ? 0 : num;
+        if (isNaN(num)) return 0;
+        return isNegative ? -num : num;
       };
 
       // RTG OLD table structure:
@@ -5045,9 +5060,14 @@ class Scraper {
       const lastMonthStats = await contentFrame.evaluate(() => {
         const parseNum = (text) => {
           if (!text) return 0;
-          text = text.toString().replace(/[$,]/g, '').trim();
+          text = text.toString().trim();
+          // Check for accounting notation: (xxx) means negative
+          const isNegative = text.startsWith('(') && text.endsWith(')');
+          // Remove $, commas, parentheses, and trim
+          text = text.replace(/[$,()]/g, '').trim();
           const num = parseFloat(text);
-          return isNaN(num) ? 0 : num;
+          if (isNaN(num)) return 0;
+          return isNegative ? -num : num;
         };
 
         const stats = {
@@ -5964,7 +5984,11 @@ class Scraper {
 
   /**
    * Scrape Casino Rewards - Monthly Stats Scraper
-   * Logs in, navigates to monthly stats, extracts totals from footer
+   * Strategy:
+   * 1. Login
+   * 2. Scrape payments.aspx for ALL historical monthly revenue (accurate $ values)
+   * 3. Scrape wager_monthly.aspx for current month clicks/signups/FTDs
+   * 4. Combine the data
    */
   async scrapeCasinoRewards({ loginUrl, username, password, programName = 'Casino Rewards' }) {
     this.log(`Starting Casino Rewards scrape for ${programName}...`);
@@ -6013,7 +6037,6 @@ class Scraper {
       for (const selector of submitButtonSelectors) {
         try {
           const buttonClicked = await page.evaluate((sel) => {
-            // Handle text-based selectors
             if (sel.includes(':has-text')) {
               const text = sel.match(/:has-text\("(.+?)"\)/)?.[1];
               if (text) {
@@ -6025,7 +6048,6 @@ class Scraper {
                 }
               }
             } else {
-              // Regular selector
               const element = document.querySelector(sel);
               if (element) {
                 element.click();
@@ -6046,12 +6068,10 @@ class Scraper {
       }
 
       if (!submitted) {
-        // Try form submission via Enter key
         this.log('Trying Enter key to submit...');
         await page.keyboard.press('Enter');
       }
 
-      // Wait for navigation
       await Promise.race([
         page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }),
         this.delay(3000)
@@ -6059,249 +6079,294 @@ class Scraper {
 
       this.log('✓ Login successful!');
 
-      // Navigate to Dashboard first
-      this.log('Looking for Dashboard link...');
-      const dashboardClicked = await page.evaluate(() => {
-        const keywords = ['dashboard', 'home', 'overview'];
-        const links = Array.from(document.querySelectorAll('a, button'));
+      // Get base URL for navigation
+      const currentUrl = page.url();
+      const baseUrl = currentUrl.match(/^(https?:\/\/[^\/]+)/)?.[1];
+      const affiliateBase = currentUrl.match(/^(https?:\/\/[^\/]+\/members\/affiliate)/)?.[1] || `${baseUrl}/members/affiliate`;
 
-        for (const link of links) {
-          const text = link.textContent?.toLowerCase().trim() || '';
-          const href = link.getAttribute('href')?.toLowerCase() || '';
+      // ═══════════════════════════════════════════════════════════════════
+      // STEP 1: Scrape PAYMENTS page for historical monthly revenue
+      // ═══════════════════════════════════════════════════════════════════
+      this.log('═══ STEP 1: Scraping Payments page for historical revenue ═══');
 
-          for (const keyword of keywords) {
-            if (text.includes(keyword) || href.includes(keyword)) {
-              console.log(`Found dashboard link: "${text}" (${href})`);
-              link.click();
-              return true;
-            }
-          }
-        }
-        return false;
-      });
-
-      if (dashboardClicked) {
-        this.log('✓ Clicked Dashboard link');
-        await Promise.race([
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }),
-          this.delay(3000)
-        ]);
-      } else {
-        this.log('⚠️  No dashboard link found, assuming already on dashboard');
-      }
-
+      const paymentsUrl = `${affiliateBase}/payments.aspx`;
+      this.log(`Navigating to: ${paymentsUrl}`);
+      await page.goto(paymentsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await this.delay(2000);
 
-      const currentUrl = page.url();
-      const pageTitle = await page.title();
-      this.log(`Current page: ${pageTitle} (${currentUrl})`);
+      // Extract all monthly earnings from the payments table (may have multiple pages)
+      const monthlyRevenue = {};
 
-      // Extract GRAND TOTAL revenue from dashboard
-      this.log('Extracting GRAND TOTAL from dashboard...');
+      // Function to extract from current page
+      const extractPaymentsPage = async () => {
+        return await page.evaluate(() => {
+          const parseNumber = (text) => {
+            if (!text) return 0;
+            const cleaned = text.replace(/[\$,]/g, '').trim();
+            const num = parseFloat(cleaned);
+            return isNaN(num) ? 0 : num;
+          };
 
-      const revenue = await page.evaluate(() => {
-        if (!document.body) {
-          console.log('No document body found');
-          return { value: 0, debug: 'No body' };
-        }
+          const monthMap = {
+            'january': 0, 'february': 1, 'march': 2, 'april': 3,
+            'may': 4, 'june': 5, 'july': 6, 'august': 7,
+            'september': 8, 'october': 9, 'november': 10, 'december': 11
+          };
 
-        const bodyText = document.body.innerText || '';
+          const results = [];
 
-        // Log first 1000 chars for debugging
-        console.log('Page body preview:', bodyText.substring(0, 1000));
+          // Find all data rows in the payments table
+          const rows = document.querySelectorAll('tr[id*="DXDataRow"]');
+          console.log(`Found ${rows.length} data rows in payments table`);
 
-        // Common patterns for grand total, revenue, balance, earnings
-        const patterns = [
-          /grand\s*total[:\s]+\$?([\d,]+\.?\d*)/i,
-          /total\s*revenue[:\s]+\$?([\d,]+\.?\d*)/i,
-          /total\s*earnings?[:\s]+\$?([\d,]+\.?\d*)/i,
-          /balance[:\s]+\$?([\d,]+\.?\d*)/i,
-          /current\s*balance[:\s]+\$?([\d,]+\.?\d*)/i,
-          /earned[:\s]+\$?([\d,]+\.?\d*)/i,
-          /commission[:\s]+\$?([\d,]+\.?\d*)/i,
-          /total[:\s]+\$?([\d,]+\.?\d*)/i
-        ];
-
-        console.log('Searching for revenue patterns...');
-
-        for (const pattern of patterns) {
-          const match = bodyText.match(pattern);
-          if (match) {
-            const value = parseFloat(match[1].replace(/,/g, ''));
-            console.log(`✓ Found via pattern: ${match[0]} = ${value}`);
-            return { value, debug: `Pattern: ${match[0]}` };
-          }
-        }
-
-        // Try table-based extraction
-        const tables = document.querySelectorAll('table');
-        console.log(`Checking ${tables.length} tables...`);
-
-        for (const table of tables) {
-          const rows = table.querySelectorAll('tr');
           for (const row of rows) {
-            const cells = Array.from(row.querySelectorAll('td, th'));
-            if (cells.length >= 2 && cells[0] && cells[1]) {
-              const label = cells[0].innerText?.toLowerCase().trim() || '';
-              const value = cells[1].innerText?.trim() || '';
+            const cells = Array.from(row.querySelectorAll('td'));
+            if (cells.length < 2) continue;
 
-              // Check for various revenue keywords
-              if (label.includes('grand') || label.includes('total') ||
-                  label.includes('balance') || label.includes('revenue') ||
-                  label.includes('earned') || label.includes('commission')) {
-                const num = parseFloat(value.replace(/[^0-9.-]/g, ''));
-                if (!isNaN(num) && num !== 0) {
-                  console.log(`✓ Found in table: ${label} = ${num}`);
-                  return { value: num, debug: `Table: ${label}` };
-                }
+            // First cell contains month link (e.g., "April 2024")
+            const dateCell = cells[0]?.innerText?.trim().toLowerCase() || '';
+            const earningsCell = cells[1]?.innerText?.trim() || '';
+
+            // Parse the month/year
+            let monthNum = -1;
+            let year = 0;
+
+            for (const [monthName, num] of Object.entries(monthMap)) {
+              if (dateCell.includes(monthName)) {
+                monthNum = num;
+                break;
+              }
+            }
+
+            const yearMatch = dateCell.match(/(\d{4})/);
+            if (yearMatch) {
+              year = parseInt(yearMatch[1]);
+            }
+
+            if (monthNum >= 0 && year > 0) {
+              const revenue = parseNumber(earningsCell);
+              console.log(`Payment row: ${dateCell} = $${revenue}`);
+              results.push({
+                year,
+                month: monthNum,
+                revenue: Math.round(revenue * 100) // Convert to cents
+              });
+            }
+          }
+
+          // Check if there's a next page
+          const nextButton = document.querySelector('td.dxpButton_Office2003Silver:not(.dxpDisabledButton_Office2003Silver) img[alt="Next"]');
+          const hasNextPage = !!nextButton;
+
+          return { results, hasNextPage };
+        });
+      };
+
+      // Extract first page
+      let pageData = await extractPaymentsPage();
+      for (const item of pageData.results) {
+        const key = `${item.year}-${String(item.month + 1).padStart(2, '0')}`;
+        monthlyRevenue[key] = item.revenue;
+      }
+      this.log(`Extracted ${pageData.results.length} months from payments page 1`);
+
+      // Paginate through all pages (limit to 15 pages to avoid infinite loops)
+      let pageNum = 1;
+      while (pageData.hasNextPage && pageNum < 15) {
+        pageNum++;
+        this.log(`Navigating to payments page ${pageNum}...`);
+
+        // Click next button
+        await page.evaluate(() => {
+          const nextButton = document.querySelector('td.dxpButton_Office2003Silver:not(.dxpDisabledButton_Office2003Silver) img[alt="Next"]');
+          if (nextButton) {
+            nextButton.parentElement?.click();
+          }
+        });
+
+        await this.delay(2000);
+
+        pageData = await extractPaymentsPage();
+        for (const item of pageData.results) {
+          const key = `${item.year}-${String(item.month + 1).padStart(2, '0')}`;
+          monthlyRevenue[key] = item.revenue;
+        }
+        this.log(`Extracted ${pageData.results.length} months from payments page ${pageNum}`);
+      }
+
+      this.log(`✓ Total historical months with revenue: ${Object.keys(monthlyRevenue).length}`);
+
+      // ═══════════════════════════════════════════════════════════════════
+      // STEP 2: Scrape MONTHLY STATS page for clicks/signups/FTDs
+      // ═══════════════════════════════════════════════════════════════════
+      this.log('═══ STEP 2: Scraping Monthly Stats for clicks/signups/FTDs ═══');
+
+      const monthlyStatsUrl = `${affiliateBase}/wager/wager_monthly.aspx`;
+      this.log(`Navigating to: ${monthlyStatsUrl}`);
+      await page.goto(monthlyStatsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await this.delay(2000);
+
+      // Check what month the page is showing from the header
+      const pageMonth = await page.evaluate(() => {
+        const header = document.querySelector('#controlHeader_middle h2, h2');
+        if (header) {
+          const text = header.innerText || '';
+          console.log(`Page header: ${text}`);
+          // Parse "Casino Stats for Sunday, 1 February 2026"
+          const monthMap = {
+            'january': 0, 'february': 1, 'march': 2, 'april': 3,
+            'may': 4, 'june': 5, 'july': 6, 'august': 7,
+            'september': 8, 'october': 9, 'november': 10, 'december': 11
+          };
+
+          for (const [monthName, num] of Object.entries(monthMap)) {
+            if (text.toLowerCase().includes(monthName)) {
+              const yearMatch = text.match(/(\d{4})/);
+              if (yearMatch) {
+                return { month: num, year: parseInt(yearMatch[1]), text };
               }
             }
           }
         }
-
-        // Try finding any element with dollar amounts
-        const allElements = document.querySelectorAll('div, span, p, td, th, h1, h2, h3');
-        const amounts = [];
-
-        for (const el of allElements) {
-          const text = el.innerText?.trim() || '';
-          const match = text.match(/^\$?([\d,]+\.\d{2})$/);
-          if (match && el.children.length === 0) { // leaf node only
-            const value = parseFloat(match[1].replace(/,/g, ''));
-            if (value > 0) {
-              amounts.push({ value, context: el.parentElement?.innerText?.substring(0, 100) });
-            }
-          }
-        }
-
-        if (amounts.length > 0) {
-          console.log('Found dollar amounts:', amounts.slice(0, 5));
-        }
-
-        console.log('❌ Could not find revenue');
-        return { value: 0, debug: `No match. Page has ${bodyText.length} chars` };
+        return null;
       });
 
-      this.log(`Dashboard revenue: $${revenue.value} (${revenue.debug})`);
+      if (pageMonth) {
+        this.log(`Page showing stats for: ${pageMonth.text}`);
+      }
 
-      // Now navigate to Monthly Stats for clicks/signups/FTDs
-      this.log('Looking for Monthly Stats link...');
-      const monthlyStatsClicked = await page.evaluate(() => {
-        const keywords = ['monthly', 'monthly stats', 'monthly earnings', 'month'];
-        const links = Array.from(document.querySelectorAll('a'));
+      // Extract stats from the monthly stats table footer
+      const extractMonthlyStats = async () => {
+        return await page.evaluate(() => {
+          const parseNumber = (text) => {
+            if (!text) return 0;
+            const cleaned = text.replace(/[\$,]/g, '').trim();
+            const num = parseFloat(cleaned);
+            return isNaN(num) ? 0 : num;
+          };
 
-        for (const link of links) {
-          const text = link.textContent?.toLowerCase().trim() || '';
-          const href = link.getAttribute('href')?.toLowerCase() || '';
+          // Look for footer row with totals
+          const footerRow = document.querySelector('tr.dxgvFooter_Office2003Silver, tr[id*="DXFooterRow"]');
+          if (!footerRow) {
+            console.log('No footer row found');
+            return null;
+          }
 
-          // Look for links containing "monthly" or "wager_monthly"
-          if (text.includes('monthly') || href.includes('monthly') || href.includes('wager_monthly')) {
-            console.log(`Found monthly stats link: "${text}" (${href})`);
-            link.click();
+          const cells = Array.from(footerRow.querySelectorAll('td'));
+          console.log(`Footer has ${cells.length} cells`);
+
+          if (cells.length < 5) {
+            return null;
+          }
+
+          // Column mapping (0-indexed):
+          // 0: Empty/label
+          // 1: Clicks
+          // 2: Started Registrations
+          // 3: Registrations (signups)
+          // 4: New Bettors (FTDs)
+          return {
+            clicks: parseNumber(cells[1]?.innerText),
+            signups: parseNumber(cells[3]?.innerText),
+            ftds: parseNumber(cells[4]?.innerText)
+          };
+        });
+      };
+
+      // Get current month stats
+      const currentStats = await extractMonthlyStats();
+      const today = new Date();
+      const currentYear = today.getFullYear();
+      const currentMonth = today.getMonth();
+
+      const monthlyStats = {};
+
+      if (currentStats && pageMonth) {
+        const key = `${pageMonth.year}-${String(pageMonth.month + 1).padStart(2, '0')}`;
+        monthlyStats[key] = currentStats;
+        this.log(`Current month (${key}): clicks=${currentStats.clicks}, signups=${currentStats.signups}, ftds=${currentStats.ftds}`);
+      }
+
+      // Try to get last month's stats using date picker
+      this.log('Attempting to get last month stats...');
+      const lastMonthDate = new Date(currentYear, currentMonth - 1, 1);
+      const lastMonthKey = `${lastMonthDate.getFullYear()}-${String(lastMonthDate.getMonth() + 1).padStart(2, '0')}`;
+
+      // Look for a date picker/dropdown to change month
+      const changedMonth = await page.evaluate((targetMonth, targetYear) => {
+        // Look for month/year dropdowns
+        const monthDropdown = document.querySelector('select[id*="Month"], select[name*="month"]');
+        const yearDropdown = document.querySelector('select[id*="Year"], select[name*="year"]');
+
+        if (monthDropdown && yearDropdown) {
+          monthDropdown.value = String(targetMonth);
+          yearDropdown.value = String(targetYear);
+          
+          // Trigger change events
+          monthDropdown.dispatchEvent(new Event('change', { bubbles: true }));
+          yearDropdown.dispatchEvent(new Event('change', { bubbles: true }));
+          
+          // Look for submit/go button
+          const submitBtn = document.querySelector('input[type="submit"], button[type="submit"], input[value="Go"], input[value="View"]');
+          if (submitBtn) {
+            submitBtn.click();
             return true;
           }
         }
-        return false;
-      });
 
-      if (monthlyStatsClicked) {
-        this.log('✓ Clicked Monthly Stats link');
-        await Promise.race([
-          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }),
-          this.delay(3000)
-        ]);
-      } else {
-        this.log('⚠️  No monthly stats link found, trying to construct URL...');
-        // Try to navigate directly to wager_monthly.aspx
-        const currentUrl = page.url();
-        const baseUrl = currentUrl.match(/^(https?:\/\/[^\/]+)/)?.[1];
-        if (baseUrl) {
-          const monthlyUrl = `${baseUrl}/wager_monthly.aspx`;
-          this.log(`Attempting to navigate to: ${monthlyUrl}`);
-          await page.goto(monthlyUrl, { waitUntil: 'networkidle2', timeout: 10000 });
+        // Try calendar-style navigation
+        const prevButton = document.querySelector('a[href*="prev"], a[title*="Previous"], img[alt*="Prev"]');
+        if (prevButton) {
+          prevButton.click();
+          return true;
         }
+
+        return false;
+      }, lastMonthDate.getMonth() + 1, lastMonthDate.getFullYear());
+
+      if (changedMonth) {
+        await this.delay(3000);
+        const lastMonthStats = await extractMonthlyStats();
+        if (lastMonthStats) {
+          monthlyStats[lastMonthKey] = lastMonthStats;
+          this.log(`Last month (${lastMonthKey}): clicks=${lastMonthStats.clicks}, signups=${lastMonthStats.signups}, ftds=${lastMonthStats.ftds}`);
+        }
+      } else {
+        this.log('Could not navigate to last month - no date picker found');
       }
 
-      await this.delay(2000);
+      // ═══════════════════════════════════════════════════════════════════
+      // STEP 3: Combine revenue data with stats data
+      // ═══════════════════════════════════════════════════════════════════
+      this.log('═══ STEP 3: Combining revenue with stats ═══');
 
-      // Extract stats from monthly table footer
-      this.log('Extracting monthly stats from footer row...');
+      const statsData = [];
+      const allMonths = new Set([...Object.keys(monthlyRevenue), ...Object.keys(monthlyStats)]);
 
-      const stats = await page.evaluate(() => {
-        // Look for the table with monthly stats
-        // The footer row has class "dxgvFooter_Office2003Silver"
-        const footerRow = document.querySelector('tr.dxgvFooter_Office2003Silver, tr[id*="DXFooterRow"]');
+      for (const monthKey of allMonths) {
+        const [year, month] = monthKey.split('-').map(Number);
+        const dateStr = `${year}-${String(month).padStart(2, '0')}-01`;
 
-        if (!footerRow) {
-          console.log('No footer row found');
-          return null;
-        }
+        const revenue = monthlyRevenue[monthKey] || 0;
+        const stats = monthlyStats[monthKey] || { clicks: 0, signups: 0, ftds: 0 };
 
-        const cells = Array.from(footerRow.querySelectorAll('td'));
-        console.log(`Found ${cells.length} cells in footer`);
-
-        if (cells.length < 8) {
-          console.log('Not enough cells in footer row');
-          return null;
-        }
-
-        // Log all cell values for debugging
-        cells.forEach((cell, i) => {
-          console.log(`Cell ${i}: ${cell.innerText?.trim() || ''}`);
+        statsData.push({
+          date: dateStr,
+          clicks: stats.clicks,
+          impressions: 0,
+          signups: stats.signups,
+          ftds: stats.ftds,
+          deposits: 0,
+          revenue: revenue
         });
 
-        // Column mapping (0-indexed):
-        // 0: Empty/label
-        // 1: Clicks
-        // 2: Started Registrations
-        // 3: Registrations (signups)
-        // 4: New Bettors (FTDs)
-        // 5: Betting Players (average)
-        // 6: Wagered
-        // 7: Earned (NOT used - incomplete calculation)
-
-        const parseNumber = (text) => {
-          if (!text) return 0;
-          // Remove $ and commas, keep numbers and decimal
-          const cleaned = text.replace(/[\$,]/g, '').trim();
-          const num = parseFloat(cleaned);
-          return isNaN(num) ? 0 : num;
-        };
-
-        const clicks = parseNumber(cells[1]?.innerText);
-        const signups = parseNumber(cells[3]?.innerText); // Registrations
-        const ftds = parseNumber(cells[4]?.innerText); // New Bettors
-
-        console.log(`Parsed: clicks=${clicks}, signups=${signups}, ftds=${ftds}`);
-
-        return {
-          clicks,
-          signups,
-          ftds
-        };
-      });
-
-      if (!stats) {
-        throw new Error('Could not extract stats from monthly table');
+        this.log(`  ${dateStr}: clicks=${stats.clicks}, signups=${stats.signups}, ftds=${stats.ftds}, revenue=$${(revenue / 100).toFixed(2)}`);
       }
 
-      this.log(`✓ Extracted monthly totals: Clicks=${stats.clicks}, Signups=${stats.signups}, FTDs=${stats.ftds}`);
+      // Sort by date descending (newest first)
+      statsData.sort((a, b) => b.date.localeCompare(a.date));
 
-      // Create stats entry for current month (combining dashboard revenue + monthly stats)
-      const today = new Date();
-      const currentMonthDate = new Date(today.getFullYear(), today.getMonth(), 1);
-
-      const statsData = [{
-        date: currentMonthDate.toISOString().split('T')[0],
-        clicks: stats.clicks,
-        impressions: 0,
-        signups: stats.signups,
-        ftds: stats.ftds,
-        deposits: 0, // Casino Rewards does not track deposits
-        revenue: Math.round(revenue.value * 100) // Revenue from dashboard (convert to cents)
-      }];
-
-      this.log(`✓ Final stats: Clicks=${stats.clicks}, Signups=${stats.signups}, FTDs=${stats.ftds}, Revenue=$${revenue.value}`);
+      this.log(`✓ Final stats: ${statsData.length} month(s) extracted`);
 
       this.log(`✓ Extracted stats for ${programName}`);
       return statsData;
